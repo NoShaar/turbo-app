@@ -95,7 +95,7 @@ A chave secreta **não está no git**. Sem ela, quem já instalou esta versão r
 5. Atualize `releases/latest.json` com a versão, as notas, a URL HTTPS do instalador na release, o `sha256` e a `signature`.
 6. Envie `TurboApp-Setup.exe`, `SHA256SUMS.txt` e `latest.json` para a release. O nome do asset do manifesto tem que ser `latest.json`, porque é o que a URL embutida baixa.
 
-Uma tag `v*` também dispara `.github/workflows/release.yml`. Esse workflow compila o exe, gera o instalador e anexa os arquivos na release. Ele **não** assina: a chave secreta não entra no repositório. O atualizador só aceita o arquivo depois do passo local do `turbo-sign` e do `latest.json` enviado na mesma release.
+Uma tag `v*` dispara `.github/workflows/release.yml`. O workflow usa `GITHUB_TOKEN` com `contents: write` e publica a release anexando os arquivos já assinados e commitados: `dist/TurboApp-Setup.exe`, `releases/latest.json` e `releases/SHA256SUMS.txt` (ou `dist/SHA256SUMS.txt`). A compilação no Windows entra só como checagem e não substitui esses arquivos. A chave secreta não entra no repositório nem no workflow.
 
 A chave pública correspondente está em `releases/update-public-key.txt` e é compilada dentro do exe. Trocar a chave exige reinstalar à mão: o app antigo não aceita arquivo assinado por outra chave.
 
