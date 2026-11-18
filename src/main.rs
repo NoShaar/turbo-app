@@ -661,9 +661,7 @@ impl From<ManifestCache> for UpdateManifest {
 }
 
 fn check_update() -> Result<Option<UpdateManifest>, String> {
-    let Some(url) = update_url() else {
-        return Err("Nenhuma fonte de atualização. Grave a URL do manifesto em %LOCALAPPDATA%\\TurboApp\\update-source.url. O README explica como publicar.".into());
-    };
+    let url = update_url();
     let manifest = updater::load_manifest(&url).map_err(|e| e.to_string())?;
     if updater::decide(APP_VERSION, &manifest.version) == UpdateDecision::Available {
         Ok(Some(manifest))
@@ -672,23 +670,10 @@ fn check_update() -> Result<Option<UpdateManifest>, String> {
     }
 }
 
-fn update_url() -> Option<String> {
-    if let Ok(url) = std::env::var("TURBO_UPDATE_MANIFEST_URL") {
-        if url.starts_with("http") {
-            return Some(url);
-        }
-    }
-    if let Some(url) = updater::read_update_source(&store::update_source_path()) {
-        return Some(url);
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            if let Some(url) = updater::read_update_source(&dir.join("update-source.url")) {
-                return Some(url);
-            }
-        }
-    }
-    None
+fn update_url() -> String {
+    let env_url = std::env::var("TURBO_UPDATE_MANIFEST_URL").ok();
+    let beside_exe = std::env::current_exe().ok().and_then(|exe| exe.parent().map(|dir| updater::read_update_source(&dir.join("update-source.url")))).flatten();
+    updater::resolve_update_url(env_url.as_deref(), &[updater::read_update_source(&store::update_source_path()), beside_exe])
 }
 
 fn download_and_install() -> Result<(), String> {

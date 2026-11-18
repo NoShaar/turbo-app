@@ -66,15 +66,15 @@ A pasta do programa é `%LOCALAPPDATA%\TurboApp\app`. Backup e log ficam ao lado
 
 ## Atualização
 
-Não há serviço nem tarefa agendada. Ao abrir, e no botão **Verificar atualizações**, o Turbo lê uma URL de manifesto (uma vez) e compara a versão.
+Não há serviço nem tarefa agendada. Ao abrir, e no botão **Verificar atualizações**, o Turbo lê o manifesto público e compara a versão. A URL padrão já vem embutida no exe:
 
-A URL vem, nesta ordem, de:
+`https://github.com/NoShaar/turbo-app/releases/latest/download/latest.json`
 
-1. variável de ambiente `TURBO_UPDATE_MANIFEST_URL`
-2. `%LOCALAPPDATA%\TurboApp\update-source.url`
-3. `update-source.url` ao lado do exe
+Não precisa de `update-source.url`. Esse arquivo, ou a variável `TURBO_UPDATE_MANIFEST_URL`, só entra se você quiser apontar para outro manifesto.
 
-O manifesto pode ser o JSON simples de `releases/latest.json` ou a API de release do GitHub (`https://api.github.com/repos/DONO/REPO/releases/latest`), desde que o release tenha `TurboApp-Setup.exe` e `SHA256SUMS.txt`.
+O manifesto é o JSON de `releases/latest.json`. O instalador da versão 1 fica em:
+
+`https://github.com/NoShaar/turbo-app/releases/download/v1.0.0/TurboApp-Setup.exe`
 
 Se houver versão nova, o app mostra as notas. Se você aceitar, ele baixa o instalador, confere o **SHA-256** e a **assinatura Ed25519** com a chave pública embutida no exe, e só então inicia a instalação. Hash ou assinatura diferentes: o arquivo é descartado e nada é instalado.
 
@@ -92,10 +92,10 @@ A chave secreta **não está no git**. Sem ela, quem já instalou esta versão r
 
    A saída tem o SHA-256 e a linha `# signature TurboApp-Setup.exe ...`.
 4. Publique o instalador em HTTPS.
-5. Atualize `releases/latest.json` com a versão, as notas, a URL, o `sha256` e a `signature`.
-6. Aponte `update-source.url` (na instalação, ou `%LOCALAPPDATA%\TurboApp\update-source.url`) para a URL desse JSON.
+5. Atualize `releases/latest.json` com a versão, as notas, a URL HTTPS do instalador na release, o `sha256` e a `signature`.
+6. Envie `TurboApp-Setup.exe`, `SHA256SUMS.txt` e `latest.json` para a release. O nome do asset do manifesto tem que ser `latest.json`, porque é o que a URL embutida baixa.
 
-Alternativa no GitHub: crie um release com a tag `v1.2.0` (a tag é a versão), anexe `TurboApp-Setup.exe` e `SHA256SUMS.txt` (com a linha de assinatura) e use a URL `https://api.github.com/repos/DONO/REPO/releases/latest` no `update-source.url`.
+Uma tag `v*` também dispara `.github/workflows/release.yml`. Esse workflow compila o exe, gera o instalador e anexa os arquivos na release. Ele **não** assina: a chave secreta não entra no repositório. O atualizador só aceita o arquivo depois do passo local do `turbo-sign` e do `latest.json` enviado na mesma release.
 
 A chave pública correspondente está em `releases/update-public-key.txt` e é compilada dentro do exe. Trocar a chave exige reinstalar à mão: o app antigo não aceita arquivo assinado por outra chave.
 

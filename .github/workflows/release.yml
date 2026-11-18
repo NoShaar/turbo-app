@@ -1,0 +1,57 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  publicar:
+    name: Compilar e anexar na release
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Compilar o exe
+        run: cargo build --release --features ui --bin turbo-app
+      - name: Instalar NSIS
+        run: choco install nsis --no-progress -y
+      - name: Gerar o instalador
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target/release/turbo-app.exe dist/turbo-app.exe -Force
+          $makensis = @(
+            "$env:ProgramFiles\NSIS\makensis.exe",
+            "${env:ProgramFiles(x86)}\NSIS\makensis.exe"
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $makensis) { throw "makensis não encontrado" }
+          Push-Location installer
+          & $makensis turbo.nsi
+          if ($LASTEXITCODE -ne 0) { throw "NSIS falhou" }
+          Pop-Location
+      - name: Gravar SHA-256
+        shell: pwsh
+        run: |
+          $setup = (Get-FileHash dist/TurboApp-Setup.exe -Algorithm SHA256).Hash.ToLower()
+          $exe = (Get-FileHash dist/turbo-app.exe -Algorithm SHA256).Hash.ToLower()
+          @(
+            "$setup  TurboApp-Setup.exe",
+            "$exe  turbo-app.exe",
+            "# Assinatura Ed25519 e latest.json sao feitos na maquina local com turbo-sign.",
+            "# A chave secreta nao entra neste workflow."
+          ) | Set-Content -Encoding ascii dist/SHA256SUMS.txt
+      - name: Anexar na release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          gh release create "${{ github.ref_name }}" `
+            dist/TurboApp-Setup.exe `
+            dist/turbo-app.exe `
+            dist/SHA256SUMS.txt `
+            --title "${{ github.ref_name }}" `
+            --notes "Build automatico da tag. O atualizador so aceita o instalador depois da assinatura local e do latest.json. Veja o README. A chave secreta nao esta no repositorio."

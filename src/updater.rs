@@ -16,6 +16,14 @@ use crate::model::APP_VERSION;
 
 pub const EMBEDDED_PUBLIC_KEY_HEX: &str = include_str!("../releases/update-public-key.txt");
 
+/// Manifesto público da release mais recente. Não precisa de token.
+pub const DEFAULT_MANIFEST_URL: &str =
+    "https://github.com/NoShaar/turbo-app/releases/latest/download/latest.json";
+
+/// URL direta do instalador da versão 1, gravada no `latest.json` publicado.
+pub const V1_SETUP_URL: &str =
+    "https://github.com/NoShaar/turbo-app/releases/download/v1.0.0/TurboApp-Setup.exe";
+
 const SETUP_NAME: &str = "TurboApp-Setup.exe";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -282,6 +290,20 @@ pub fn load_manifest(url: &str) -> Result<UpdateManifest, UpdateError> {
     parse_plain_manifest(&text)
 }
 
+/// Ambiente e arquivos locais substituem a URL embutida. Sem eles, vale o GitHub.
+pub fn resolve_update_url(env_url: Option<&str>, file_urls: &[Option<String>]) -> String {
+    if let Some(url) = env_url.map(str::trim).filter(|url| url.starts_with("http")) {
+        return url.to_string();
+    }
+    for url in file_urls.iter().flatten() {
+        let url = url.trim();
+        if url.starts_with("http") {
+            return url.to_string();
+        }
+    }
+    DEFAULT_MANIFEST_URL.to_string()
+}
+
 pub fn read_update_source(path: &Path) -> Option<String> {
     let text = std::fs::read_to_string(path).ok()?;
     let url = text.lines().find(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))?.trim().to_string();
@@ -354,6 +376,16 @@ mod tests {
         let hash = "cd".repeat(32);
         apply_checksum_file(&mut manifest, &format!("{hash} *TurboApp-Setup.exe\n")).unwrap();
         assert_eq!(manifest.sha256, hash);
+    }
+
+    #[test]
+    fn default_manifest_is_the_public_github_release() {
+        let url = resolve_update_url(None, &[None]);
+        assert_eq!(url, DEFAULT_MANIFEST_URL);
+        assert!(url.starts_with("https://github.com/NoShaar/turbo-app/"));
+        assert!(url.ends_with("/latest.json"));
+        let custom = resolve_update_url(Some("https://exemplo.test/latest.json"), &[None]);
+        assert_eq!(custom, "https://exemplo.test/latest.json");
     }
 
     #[test]
