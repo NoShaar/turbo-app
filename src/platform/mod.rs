@@ -5,4 +5,7 @@
 pub mod windows;
 
 #[cfg(windows)]
-pub use windows::WindowsBackend;
+pub use windows::{mark_ui_thread, WindowsBackend};
+
+#[cfg(not(windows))]
+pub fn mark_ui_thread() {}

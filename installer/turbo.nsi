@@ -3,6 +3,14 @@ Unicode True
 
 Name "Turbo"
 OutFile "..\dist\TurboApp-Setup.exe"
+VIProductVersion "1.0.1.0"
+VIFileVersion "1.0.1.0"
+VIAddVersionKey "ProductName" "Turbo App"
+VIAddVersionKey "CompanyName" "NoShaar"
+VIAddVersionKey "FileVersion" "1.0.1"
+VIAddVersionKey "FileDescription" "Instalador do Turbo App"
+VIAddVersionKey "OriginalFilename" "TurboApp-Setup.exe"
+VIAddVersionKey "LegalCopyright" "NoShaar"
 InstallDir "$LOCALAPPDATA\TurboApp\app"
 RequestExecutionLevel user
 SetCompressor /SOLID lzma

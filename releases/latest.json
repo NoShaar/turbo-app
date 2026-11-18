@@ -1,10 +1,10 @@
 {
-  "version": "1.0.0",
-  "notes": "Primeira versão. Diagnóstico só de leitura, backup com ponto de restauração, os 21 itens da especificação e atualizador com SHA-256 e assinatura Ed25519.",
+  "version": "1.0.1",
+  "notes": "Corrige o fechamento imediato ao abrir no Windows 11 (OleInitialize / RPC_E_CHANGED_MODE, exceção 0xc0000409). O diagnóstico COM e WMI passa a rodar numa thread de trabalho, fora da thread da janela. Se o app falhar, a mensagem e o backtrace vão para %LOCALAPPDATA%\\TurboApp\\crash.log e uma caixa de diálogo aparece. O executável e o instalador agora identificam o produto Turbo App, a empresa NoShaar e a versão 1.0.1.",
   "setup": {
     "name": "TurboApp-Setup.exe",
-    "url": "https://github.com/NoShaar/turbo-app/releases/download/v1.0.0/TurboApp-Setup.exe",
-    "sha256": "b089a6eb1b700c19cefd65fcd41ef3d12417d9f7fee660e61585346d9d17eeb3",
-    "signature": "54c57a6bd8d735d22e3a3463f89a53fcb4231c2c9f4114de979c8fcb0ded9226df89a2080648741f511e09659c908639938501c399e37368a62b4fe849932606"
+    "url": "https://github.com/NoShaar/turbo-app/releases/download/v1.0.1/TurboApp-Setup.exe",
+    "sha256": "0c941fdc004ecb604a7ddec94658a85335bf3d39522eb59c894b5c9cbdd4b6a3",
+    "signature": "aaf02a1056010218b86395ef1fa7f062781a2b430cd675566c2a9f7a5ba1a382b1aba85357b303bc237d76bec1f8417906c684317d3a882efe6a8e1e2f0e8c0c"
   }
 }

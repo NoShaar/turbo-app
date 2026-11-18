@@ -52,6 +52,7 @@ enum FollowUp {
 }
 
 fn main() {
+    install_panic_hook();
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--version") {
         println!("Turbo {APP_VERSION}");
@@ -78,6 +79,7 @@ fn flag(args: &[String], name: &str) -> Option<String> {
 }
 
 fn ui_main() {
+    turbo::platform::mark_ui_thread();
     let _ = std::fs::create_dir_all(store::data_dir());
     let backup = store::load_backup(&store::backup_path()).ok().flatten();
     let admin = store::load_admin_cache(&store::admin_cache_path());
@@ -114,9 +116,18 @@ fn ui_main() {
 
     wire_actions(&ui, &host, &session);
     show_page(&ui, &session, &host, &std::env::var("TURBO_PAGE").unwrap_or_else(|_| "home".into()));
-    refresh(&ui, &host, &session, false);
-    spawn_disk_sample(ui.as_weak(), host.clone(), session.clone());
-    spawn_update_check(ui.as_weak(), false);
+    let weak = ui.as_weak();
+    let host_boot = host.clone();
+    let session_boot = session.clone();
+    // A janela do winit precisa de COM STA. O diagnóstico só começa depois
+    // que o loop está no ar, e o COM MTA fica numa thread de trabalho.
+    slint::Timer::single_shot(Duration::from_millis(0), move || {
+        if let Some(ui) = weak.upgrade() {
+            refresh(&ui, &host_boot, &session_boot, false);
+            spawn_disk_sample(ui.as_weak(), host_boot.clone(), session_boot.clone());
+            spawn_update_check(ui.as_weak(), false);
+        }
+    });
     ui.run().expect("rodar a interface");
 }
 
@@ -775,19 +786,20 @@ fn write_result(path: Option<&str>, lines: Vec<String>) {
     let _ = std::fs::write(path, serde_json::to_vec(&lines).unwrap_or_default());
 }
 
-fn with_backend(host: &Host, f: impl FnOnce(&mut dyn SystemBackend)) {
+fn with_backend(host: &Host, f: impl FnOnce(&mut dyn SystemBackend) + Send) {
     let _ = with_backend_result_on(host, |sys| {
         f(sys);
         Ok::<(), String>(())
     });
 }
 
-fn with_backend_result(f: impl FnOnce(&mut dyn SystemBackend)) -> Result<(), String> {
+fn with_backend_result(f: impl FnOnce(&mut dyn SystemBackend) + Send) -> Result<(), String> {
     #[cfg(windows)]
     {
-        let mut backend = turbo::platform::WindowsBackend::new()?;
-        f(&mut backend);
-        Ok(())
+        on_com_thread(|sys| {
+            f(sys);
+            Ok(())
+        })
     }
     #[cfg(not(windows))]
     {
@@ -796,14 +808,63 @@ fn with_backend_result(f: impl FnOnce(&mut dyn SystemBackend)) -> Result<(), Str
     }
 }
 
-fn with_backend_result_on(host: &Host, f: impl FnOnce(&mut dyn SystemBackend) -> Result<(), String>) -> Result<(), String> {
+fn with_backend_result_on(host: &Host, f: impl FnOnce(&mut dyn SystemBackend) -> Result<(), String> + Send) -> Result<(), String> {
     match host {
         Host::Demo(fake) => f(&mut *fake.lock().expect("demo")),
         #[cfg(windows)]
-        Host::Windows => {
-            let mut backend = turbo::platform::WindowsBackend::new()?;
-            f(&mut backend)
-        }
+        Host::Windows => on_com_thread(f),
+    }
+}
+
+/// COM MTA numa thread que não é a da janela. O winit chama OleInitialize (STA)
+/// na thread principal; misturar os dois no mesmo thread derruba o processo
+/// com RPC_E_CHANGED_MODE (0xc0000409).
+#[cfg(windows)]
+fn on_com_thread(f: impl FnOnce(&mut dyn SystemBackend) -> Result<(), String> + Send) -> Result<(), String> {
+    let mut out = None;
+    std::thread::scope(|scope| {
+        let handle = std::thread::Builder::new().name("turbo-com".into()).spawn_scoped(scope, || {
+            turbo::platform::WindowsBackend::with_session(|backend| f(backend))
+        });
+        out = Some(match handle {
+            Ok(handle) => match handle.join() {
+                Ok(Ok(inner)) => inner,
+                Ok(Err(err)) => Err(err),
+                Err(_) => Err("a thread COM encerrou com panic".into()),
+            },
+            Err(err) => Err(err.to_string()),
+        });
+    });
+    out.unwrap_or_else(|| Err("a thread COM não devolveu resultado".into()))
+}
+
+fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        let message = format!("{info}\n\n{backtrace}");
+        let path = store::data_dir().join("crash.log");
+        let _ = std::fs::create_dir_all(store::data_dir());
+        let entry = format!("\n---- {} ----\n{message}\n", turbo::model::now_rfc3339());
+        let _ = std::fs::OpenOptions::new().create(true).append(true).open(&path).and_then(|mut file| {
+            use std::io::Write;
+            file.write_all(entry.as_bytes())
+        });
+        #[cfg(windows)]
+        show_crash_box(&message, &path);
+        eprintln!("{message}");
+    }));
+}
+
+#[cfg(windows)]
+fn show_crash_box(message: &str, log_path: &Path) {
+    use windows::core::HSTRING;
+    use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK, MB_SETFOREGROUND};
+    let short: String = message.chars().take(1200).collect();
+    let text = format!("O Turbo encontrou um erro e precisa fechar.\n\n{short}\n\nDetalhes em {}", log_path.display());
+    let text = HSTRING::from(text);
+    let title = HSTRING::from("Turbo App");
+    unsafe {
+        MessageBoxW(None, &text, &title, MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
     }
 }
 

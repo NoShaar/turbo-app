@@ -50,14 +50,44 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 const NET_CLASS: &str = r"SYSTEM\CurrentControlSet\Control\Class\{4d36e972-e325-11ce-bfc1-08002be10318}";
 
+static UI_THREAD: std::sync::OnceLock<std::thread::ThreadId> = std::sync::OnceLock::new();
+
+/// Marca a thread da janela. `WindowsBackend::new` recusa essa thread porque
+/// o `wmi` chama `CoInitializeEx(COINIT_MULTITHREADED)` e o winit precisa de STA.
+pub fn mark_ui_thread() {
+    let _ = UI_THREAD.set(std::thread::current().id());
+}
+
 pub struct WindowsBackend {
     _com: COMLibrary,
 }
 
+/// Solta o `COMLibrary` e só então chama `CoUninitialize`.
+struct ComSession {
+    backend: Option<WindowsBackend>,
+}
+
+impl Drop for ComSession {
+    fn drop(&mut self) {
+        self.backend.take();
+        unsafe { windows::Win32::System::Com::CoUninitialize() };
+    }
+}
+
 impl WindowsBackend {
+    /// Inicializa COM em MTA. Só pode ser chamado numa thread de trabalho.
     pub fn new() -> Result<Self, String> {
+        if UI_THREAD.get().copied() == Some(std::thread::current().id()) {
+            return Err("COM multithread não pode ser inicializado na thread da janela".into());
+        }
         let com = COMLibrary::new().map_err(|e| e.to_string())?;
         Ok(Self { _com: com })
+    }
+
+    /// Cria o backend, executa `f` e desfaz o COM nesta thread.
+    pub fn with_session<T>(f: impl FnOnce(&mut Self) -> T) -> Result<T, String> {
+        let mut session = ComSession { backend: Some(Self::new()?) };
+        Ok(f(session.backend.as_mut().expect("sessão COM")))
     }
 
     fn wmi(&self, namespace: &str) -> Result<WMIConnection, BackendError> {
@@ -1289,6 +1319,20 @@ fn recent_restore(backend: &WindowsBackend) -> Result<Option<RestorePointInfo>, 
         }
     }
     Ok(best)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn com_mta_recusado_na_thread_da_janela() {
+        mark_ui_thread();
+        match WindowsBackend::new() {
+            Err(err) => assert!(err.contains("janela"), "{err}"),
+            Ok(_) => panic!("a thread da janela não pode inicializar COM"),
+        }
+    }
 }
 
 fn parse_wmi_time(text: &str) -> Option<chrono::DateTime<chrono::Utc>> {
