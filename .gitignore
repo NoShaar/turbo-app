@@ -1,0 +1,6 @@
+/target
+**/*.rs.bk
+release/*.key
+releases/*.key
+*.pdb
+.DS_Store

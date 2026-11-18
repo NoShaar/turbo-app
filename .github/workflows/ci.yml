@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  testes:
+    name: Testes no Linux
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Testes do motor, do backup e do atualizador
+        run: cargo test --lib --bins
+
+  windows:
+    name: Build Windows x64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Compilar
+        run: cargo build --release --features ui --bin turbo-app
+      - uses: actions/upload-artifact@v4
+        with:
+          name: turbo-app-windows-x64
+          path: target/release/turbo-app.exe
+          if-no-files-found: error
