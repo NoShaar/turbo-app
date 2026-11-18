@@ -1,10 +1,10 @@
 {
-  "version": "1.0.2",
-  "notes": "Corrige o diagnóstico que ficava zerado. A consulta da placa de rede usava LinkSpeed, propriedade que não existe em MSFT_NetAdapter, e esse erro derrubava todas as leituras. Cada item que falha fica só como não lido, com o motivo em português. O app pede administrador ao abrir. O backup mostra o erro, respeita o limite de 24 h e oferece ligar a Proteção do Sistema, de forma reversível. O registro fica em %LOCALAPPDATA%\\TurboApp\\turbo.log.",
+  "version": "1.1.0",
+  "notes": "Interface refeita no escuro, com painel, cards e diálogos compactos. O plano Desempenho Máximo, mesmo duplicado por powercfg, deixa de ser tratado como personalizado e não é rebaixado. A economia de energia da placa de rede é desligada pelo RegistryKeyword e pelo GUID, sem depender do nome traduzido. Item ausente vira Não se aplica, em vez de erro. Cada Otimizar e cada Reverter grava o passo e o erro no log.",
   "setup": {
     "name": "TurboApp-Setup.exe",
-    "url": "https://github.com/NoShaar/turbo-app/releases/download/v1.0.2/TurboApp-Setup.exe",
-    "sha256": "78e971911debec4ab6c759472bc38e172fc1172942dcce4addcffda7142a61c2",
-    "signature": "ee41f6809e2a006b8548be683f00ec4f0609f58051723cdc5a3bb82e0de67f3c098c4b9eeae0b2184174cafdf8a96b4da71b10b32e24fddacbeb77bf9fa99f0c"
+    "url": "https://github.com/NoShaar/turbo-app/releases/download/v1.1.0/TurboApp-Setup.exe",
+    "sha256": "978a36a29114e32e3fb07291b918c5a8fd208d844528d2e79eb5a245cc0ffcff",
+    "signature": "367b27935f09fef9ca228eaca3142ccc86740a1fa0628b6670be36cad767031c34905870403141d24ac7240f8905ce094ef35a2c349212e9011eb327338b3e03"
   }
 }

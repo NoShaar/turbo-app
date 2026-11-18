@@ -7,6 +7,7 @@ pub mod engine;
 pub mod fake;
 pub mod model;
 pub mod platform;
+pub mod rules;
 pub mod store;
 pub mod tweaks;
 pub mod updater;

@@ -22,6 +22,14 @@ pub trait SystemBackend {
 
     fn power_active(&self) -> Result<String, BackendError>;
     fn power_set_active(&mut self, guid: &str) -> Result<(), BackendError>;
+    fn power_schemes(&self) -> Result<Vec<PowerSchemeInfo>, BackendError>;
+    fn power_duplicate(&mut self, source_guid: &str) -> Result<String, BackendError>;
+    fn power_delete(&mut self, guid: &str) -> Result<(), BackendError>;
+    /// O Turbo criou este plano. Fica guardado até o apply devolver o backup.
+    fn note_created_power_scheme(&mut self, guid: &str);
+    fn take_created_power_scheme(&mut self) -> Option<String>;
+    fn machine_kind(&self) -> MachineKind;
+    fn on_battery(&self) -> bool;
 
     fn mouse_accel(&self) -> Result<MouseAccel, BackendError>;
     fn set_mouse_accel(&mut self, value: MouseAccel) -> Result<(), BackendError>;
@@ -47,9 +55,11 @@ pub trait SystemBackend {
     fn set_adapter_keyword(
         &mut self,
         adapter: &str,
+        interface_guid: &str,
         keyword: &str,
         value: &str,
     ) -> Result<(), BackendError>;
+    fn restart_adapter(&mut self, adapter: &str, interface_guid: &str) -> Result<(), BackendError>;
 
     fn physical_printers(&self) -> Result<Vec<String>, BackendError>;
     fn startup_entries(&self) -> Result<Vec<StartupEntry>, BackendError>;

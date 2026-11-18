@@ -10,7 +10,7 @@ use turbo::backend::SystemBackend;
 use turbo::catalog::{self, meta};
 use turbo::engine::{self, ApplyOutcome};
 use turbo::fake::FakeBackend;
-use turbo::model::{BackupFile, ItemState, ItemView, Section, APP_VERSION};
+use turbo::model::{BackupFile, ItemState, ItemView, MachineKind, PowerTier, Section, APP_VERSION};
 use turbo::store::{self, AdminCacheFile};
 use turbo::tweaks::ReadCache;
 use turbo::updater::{self, UpdateDecision, UpdateManifest};
@@ -31,6 +31,7 @@ struct Session {
     pending: Pending,
     resume: Option<FollowUp>,
     hz_token: u64,
+    power_tier: PowerTier,
 }
 
 #[derive(Clone)]
@@ -97,6 +98,7 @@ fn ui_main() {
         pending: Pending::None,
         resume: None,
         hz_token: 0,
+        power_tier: PowerTier::Ultimate,
     }));
 
     let ui = MainWindow::new().expect("criar a janela");
@@ -116,6 +118,13 @@ fn ui_main() {
     });
 
     wire_actions(&ui, &host, &session);
+    if let Ok(size) = std::env::var("TURBO_SIZE") {
+        if let Some((w, h)) = size.split_once('x') {
+            if let (Ok(w), Ok(h)) = (w.parse::<f32>(), h.parse::<f32>()) {
+                ui.window().set_size(slint::LogicalSize::new(w, h));
+            }
+        }
+    }
     show_page(&ui, &session, &host, &std::env::var("TURBO_PAGE").unwrap_or_else(|_| "home".into()));
     let weak = ui.as_weak();
     let host_boot = host.clone();
@@ -124,6 +133,13 @@ fn ui_main() {
     // que o loop está no ar, e o COM MTA fica numa thread de trabalho.
     slint::Timer::single_shot(Duration::from_millis(0), move || {
         if let Some(ui) = weak.upgrade() {
+            if let Ok(size) = std::env::var("TURBO_SIZE") {
+                if let Some((w, h)) = size.split_once('x') {
+                    if let (Ok(w), Ok(h)) = (w.parse::<f32>(), h.parse::<f32>()) {
+                        ui.window().set_size(slint::LogicalSize::new(w, h));
+                    }
+                }
+            }
             let mut elevated = true;
             with_backend(&host_boot, |sys| elevated = sys.is_elevated());
             // No Linux a demonstração não é um processo elevado, mas os botões
@@ -135,8 +151,19 @@ fn ui_main() {
             ui.set_elevated(true);
             store::trace(&format!("janela aberta elevado={elevated}"));
             refresh(&ui, &host_boot, &session_boot, false);
-            spawn_disk_sample(ui.as_weak(), host_boot.clone(), session_boot.clone());
-            spawn_update_check(ui.as_weak(), false);
+            match std::env::var("TURBO_SHOT").ok().as_deref() {
+                Some("update") => {
+                    ui.set_update_title("Versão 1.1.0 disponível".into());
+                    ui.set_update_body("A interface foi refeita. O plano Desempenho Máximo, mesmo duplicado, deixa de ser tratado como personalizado. A placa de rede passa a ser reconhecida pelo GUID.".into());
+                    ui.set_update_open(true);
+                }
+                Some("toast") => push_toast(&ui, "Economia de energia da placa de rede desligada."),
+                Some(_) => {}
+                None => {
+                    spawn_disk_sample(ui.as_weak(), host_boot.clone(), session_boot.clone());
+                    spawn_update_check(ui.as_weak(), false);
+                }
+            }
         }
     });
     ui.run().expect("rodar a interface");
@@ -231,9 +258,9 @@ fn wire_actions(ui: &MainWindow, host: &Arc<Host>, session: &Arc<Mutex<Session>>
         });
         if let Some(ui) = ui_rm.upgrade() {
             if message.is_empty() {
-                ui.set_toast("Monitor de Recursos aberto na aba Disco.".into());
+                push_toast(&ui, "Monitor de Recursos aberto na aba Disco.");
             } else {
-                ui.set_toast(message.into());
+                push_toast(&ui, &message);
             }
         }
     });
@@ -249,13 +276,13 @@ fn wire_actions(ui: &MainWindow, host: &Arc<Host>, session: &Arc<Mutex<Session>>
                 std::process::exit(0);
             }
             if let Some(ui) = ui_admin.upgrade() {
-                ui.set_toast("O Windows não abriu a janela de administrador.".into());
+                push_toast(&ui, "O Windows não abriu a janela de administrador.");
             }
         }
         #[cfg(not(windows))]
         {
             if let Some(ui) = ui_admin.upgrade() {
-                ui.set_toast("Reabrir como administrador só existe no Windows.".into());
+                push_toast(&ui, "Reabrir como administrador só existe no Windows.");
             }
         }
     });
@@ -265,32 +292,16 @@ fn wire_actions(ui: &MainWindow, host: &Arc<Host>, session: &Arc<Mutex<Session>>
     let session_yes = session.clone();
     ui.on_accept_dialog(move || {
         if let Some(ui) = ui_yes.upgrade() {
-            ui.set_dialog_open(false);
-            let pending = session_yes.lock().expect("sessão").pending.clone();
-            session_yes.lock().expect("sessão").pending = Pending::None;
-            match pending {
-                Pending::EnableProtection => {
-                    let next = session_yes.lock().expect("sessão").resume.take();
-                    if enable_protection_and_backup(&ui, &host_yes, &session_yes) {
-                        if let Some(next) = next {
-                            run_follow(&ui, &host_yes, &session_yes, next);
-                        }
-                    }
-                }
-                Pending::NeedBackup(next) => {
-                    session_yes.lock().expect("sessão").resume = Some(next.clone());
-                    if start_backup(&ui, &host_yes, &session_yes, false) {
-                        session_yes.lock().expect("sessão").resume = None;
-                        run_follow(&ui, &host_yes, &session_yes, next);
-                    }
-                }
-                Pending::Confirm(next) => run_follow(&ui, &host_yes, &session_yes, next),
-                Pending::Hz { token } => {
-                    session_yes.lock().expect("sessão").hz_token = token.wrapping_add(1);
-                    ui.set_toast("Taxa de atualização mantida.".into());
-                }
-                Pending::None => {}
-            }
+            settle_dialog(&ui, &host_yes, &session_yes, false);
+        }
+    });
+
+    let ui_alt = ui.as_weak();
+    let host_alt = host.clone();
+    let session_alt = session.clone();
+    ui.on_alt_dialog(move || {
+        if let Some(ui) = ui_alt.upgrade() {
+            settle_dialog(&ui, &host_alt, &session_alt, true);
         }
     });
 
@@ -334,7 +345,7 @@ fn wire_actions(ui: &MainWindow, host: &Arc<Host>, session: &Arc<Mutex<Session>>
                     match outcome {
                         Ok(()) => {}
                         Err(err) => {
-                            ui.set_toast(err.into());
+                            push_toast(&ui, &err);
                         }
                     }
                 });
@@ -352,6 +363,7 @@ fn wire_actions(ui: &MainWindow, host: &Arc<Host>, session: &Arc<Mutex<Session>>
 
 fn show_page(ui: &MainWindow, session: &Mutex<Session>, host: &Host, id: &str) {
     ui.set_section_id(id.into());
+    ui.set_section_blurb(section_blurb(id).into());
     match id {
         "home" => {
             ui.set_page("home".into());
@@ -400,7 +412,7 @@ fn refresh(ui: &MainWindow, host: &Host, session: &Mutex<Session>, keep_page: bo
     let mut views = Vec::new();
     let mut error = None;
     with_backend(host, |sys| {
-        let ctx = ReadCache { disk: disk.as_ref(), disks: admin.disks.as_deref(), security: admin.security.as_ref() };
+        let ctx = read_cache(disk.as_ref(), &admin, PowerTier::Ultimate);
         match engine::diagnose_all(sys, &ctx, backup.as_ref()) {
             Ok(found) => views = found,
             Err(err) => error = Some(err.to_string()),
@@ -409,24 +421,42 @@ fn refresh(ui: &MainWindow, host: &Host, session: &Mutex<Session>, keep_page: bo
     if let Some(err) = error {
         let message = format!("O diagnóstico inteiro falhou: {err}");
         store::trace(&message);
-        ui.set_toast(message.into());
+        push_toast(&ui, &message);
         return;
     }
     let failed: Vec<String> = views.iter().filter(|v| v.detail.starts_with("Falha ao ler")).map(|v| v.detail.clone()).collect();
     if failed.is_empty() {
         let previous = ui.get_toast().to_string();
         if previous.contains("0x") || previous.contains("HRESULT") || previous.starts_with("Falha ao ler") || previous.starts_with("O diagnóstico") {
-            ui.set_toast("".into());
+            push_toast(&ui, "");
         }
     } else {
-        ui.set_toast(failed.join(" · ").into());
+        push_toast(&ui, &failed.join(" · "));
     }
     let ok = views.iter().filter(|v| v.state == ItemState::Ok).count();
     let improve = views.iter().filter(|v| v.state == ItemState::CanImprove).count();
     let unread = views.iter().filter(|v| matches!(v.state, ItemState::NotRead | ItemState::NeedsAdmin)).count();
+    let denom = ok + improve + unread;
+    let score = if denom == 0 { 100 } else { ((ok * 100) / denom) as i32 };
     ui.set_ok_count(ok.to_string().into());
     ui.set_improve_count(improve.to_string().into());
     ui.set_unread_count(unread.to_string().into());
+    ui.set_score(score);
+    #[cfg(windows)]
+    {
+        let (cpu, gpu, ram, monitor) = turbo::platform::hardware_summary();
+        ui.set_hw_cpu(cpu.into());
+        ui.set_hw_gpu(gpu.into());
+        ui.set_hw_ram(ram.into());
+        ui.set_hw_monitor(monitor.into());
+    }
+    #[cfg(not(windows))]
+    {
+        ui.set_hw_cpu("AMD Ryzen 7 5800X3D".into());
+        ui.set_hw_gpu("NVIDIA GeForce RTX 4070".into());
+        ui.set_hw_ram("32 GB".into());
+        ui.set_hw_monitor("1920×1080 · 240 Hz".into());
+    }
     ui.set_critical(critical_text(&views).into());
     ui.set_backup_text(backup_text(backup.as_ref()).into());
     {
@@ -461,21 +491,21 @@ fn start_backup(ui: &MainWindow, host: &Host, session: &Mutex<Session>, ack: boo
     }
     if let Some(err) = failed {
         store::trace(&format!("ação backup falhou: {err}"));
-        ui.set_toast(err.clone().into());
+        push_toast(&ui, &err);
         open_dialog(ui, "Não criei o backup", &err, "Ok", "", false);
         return false;
     }
     let Some(backup) = created else {
         let message = "O backup não devolveu resultado. Veja %LOCALAPPDATA%\\TurboApp\\turbo.log.".to_string();
         store::trace(&format!("ação backup sem resultado"));
-        ui.set_toast(message.clone().into());
+        push_toast(&ui, &message);
         open_dialog(ui, "Não criei o backup", &message, "Ok", "", false);
         return false;
     };
     if store::save_backup(&store::backup_path(), &backup).is_err() {
         let message = "Não consegui gravar o backup JSON em %LOCALAPPDATA%\\TurboApp\\backup.json.".to_string();
         store::trace(&format!("ação backup {message}"));
-        ui.set_toast(message.clone().into());
+        push_toast(&ui, &message);
         open_dialog(ui, "Não gravei o backup", &message, "Ok", "", false);
         return false;
     }
@@ -488,7 +518,7 @@ fn start_backup(ui: &MainWindow, host: &Host, session: &Mutex<Session>, ack: boo
     };
     let message = backup.restore_point.message.clone();
     store::trace(&format!("ação backup gravado: {message}"));
-    ui.set_toast(message.clone().into());
+    push_toast(&ui, &message);
     open_dialog(ui, title, &message, "Ok", "", false);
     session.lock().expect("sessão").pending = Pending::None;
     session.lock().expect("sessão").backup = Some(backup);
@@ -506,7 +536,7 @@ fn enable_protection_and_backup(ui: &MainWindow, host: &Host, session: &Mutex<Se
     if let Some(err) = error {
         let message = format!("Não liguei a Proteção do Sistema: {err}");
         store::trace(&format!("ação {message}"));
-        ui.set_toast(message.clone().into());
+        push_toast(&ui, &message);
         open_dialog(ui, "Proteção do Sistema", &message, "Ok", "", false);
         return false;
     }
@@ -522,11 +552,77 @@ fn enable_protection_and_backup(ui: &MainWindow, host: &Host, session: &Mutex<Se
     true
 }
 
+fn settle_dialog(ui: &MainWindow, host: &Arc<Host>, session: &Arc<Mutex<Session>>, high: bool) {
+    ui.set_dialog_open(false);
+    let pending = session.lock().expect("sessão").pending.clone();
+    session.lock().expect("sessão").pending = Pending::None;
+    match pending {
+        Pending::EnableProtection => {
+            let next = session.lock().expect("sessão").resume.take();
+            if enable_protection_and_backup(ui, host, session) {
+                if let Some(next) = next {
+                    run_follow(ui, host, session, next);
+                }
+            }
+        }
+        Pending::NeedBackup(next) => {
+            session.lock().expect("sessão").resume = Some(next.clone());
+            if start_backup(ui, host, session, false) {
+                session.lock().expect("sessão").resume = None;
+                if matches!(&next, FollowUp::One(id) if id == "p-energia") {
+                    request_apply(ui, host, session, next);
+                } else {
+                    run_follow(ui, host, session, next);
+                }
+            }
+        }
+        Pending::Confirm(next) => {
+            if matches!(&next, FollowUp::One(id) if id == "p-energia") {
+                session.lock().expect("sessão").power_tier = if high { PowerTier::High } else { PowerTier::Ultimate };
+            }
+            run_follow(ui, host, session, next);
+        }
+        Pending::Hz { token } => {
+            session.lock().expect("sessão").hz_token = token.wrapping_add(1);
+            push_toast(&ui, "Taxa de atualização mantida.");
+        }
+        Pending::None => {}
+    }
+}
+
+fn laptop_note(host: &Host) -> String {
+    let mut kind = MachineKind::Desktop;
+    let mut battery = false;
+    with_backend(host, |sys| {
+        kind = sys.machine_kind();
+        battery = sys.on_battery();
+    });
+    if kind == MachineKind::Laptop {
+        let now = if battery { " O notebook está na bateria agora." } else { "" };
+        format!("\n\nNotebook: Desempenho Máximo e Alto desempenho gastam mais bateria.{now}")
+    } else {
+        String::new()
+    }
+}
+
 fn request_apply(ui: &MainWindow, host: &Arc<Host>, session: &Arc<Mutex<Session>>, follow: FollowUp) {
     let has_backup = session.lock().expect("sessão").backup.is_some();
     if !has_backup {
         open_dialog(ui, "Backup obrigatório", "Antes da primeira alteração o Turbo cria um ponto de restauração, se a Proteção do Sistema permitir, e guarda os valores originais num JSON.", "Criar backup e continuar", "Cancelar", true);
         session.lock().expect("sessão").pending = Pending::NeedBackup(follow);
+        return;
+    }
+    let section_id = ui.get_section_id().to_string();
+    let power_choice = matches!(&follow, FollowUp::One(id) if id == "p-energia");
+    let power_section = matches!(&follow, FollowUp::Section) && section_id == "desempenho";
+    if power_choice || power_section {
+        session.lock().expect("sessão").power_tier = PowerTier::Ultimate;
+    }
+    let note = if power_choice || power_section { laptop_note(host) } else { String::new() };
+    if power_choice {
+        let caveat = meta("p-energia").and_then(|item| item.caveat).unwrap_or("");
+        open_power_dialog(ui, &format!("{caveat}\n\nDesempenho Máximo é a primeira opção. Alto desempenho fica como alternativa. Um plano que já é igual ou melhor não é trocado.{note}"));
+        session.lock().expect("sessão").pending = Pending::Confirm(follow);
         return;
     }
     let body = match &follow {
@@ -538,7 +634,7 @@ fn request_apply(ui: &MainWindow, host: &Arc<Host>, session: &Arc<Mutex<Session>
             }
             format!("{caveat}\n\nAplicar mesmo assim?")
         }
-        FollowUp::Section => "Otimizar os itens desta seção que podem melhorar. Itens só de leitura e os condicionais (SysMain e Spooler) ficam de fora.".into(),
+        FollowUp::Section => format!("Otimizar os itens desta seção que podem melhorar. Itens só de leitura e os condicionais (SysMain e Spooler) ficam de fora.{note}"),
         _ => String::new(),
     };
     let title = match &follow {
@@ -552,18 +648,19 @@ fn request_apply(ui: &MainWindow, host: &Arc<Host>, session: &Arc<Mutex<Session>
 fn run_follow(ui: &MainWindow, host: &Arc<Host>, session: &Arc<Mutex<Session>>, follow: FollowUp) {
     let backup = session.lock().expect("sessão").backup.clone();
     let Some(backup) = backup else {
-        ui.set_toast("Crie o backup antes de alterar.".into());
+        push_toast(&ui, "Crie o backup antes de alterar.");
         return;
     };
     let section_id = ui.get_section_id().to_string();
     let section = Section::all().iter().copied().find(|s| s.id() == section_id);
     let disk = session.lock().expect("sessão").disk.clone();
     let admin = session.lock().expect("sessão").admin.clone();
+    let tier = session.lock().expect("sessão").power_tier;
     let mut local = Vec::new();
     let mut admin_ids = Vec::new();
     let mut note = None;
     with_backend(host, |sys| {
-        let ctx = ReadCache { disk: disk.as_ref(), disks: admin.disks.as_deref(), security: admin.security.as_ref() };
+        let ctx = read_cache(disk.as_ref(), &admin, PowerTier::Ultimate);
         let plan = match &follow {
             FollowUp::One(id) | FollowUp::RevertOne(id) => {
                 let needs = turbo::tweaks::requires_admin(id, sys).unwrap_or(false) && !sys.is_elevated();
@@ -587,23 +684,25 @@ fn run_follow(ui: &MainWindow, host: &Arc<Host>, session: &Arc<Mutex<Session>>, 
         }
     });
     if let Some(err) = note {
-        ui.set_toast(err.into());
+        push_toast(&ui, &err);
         return;
     }
     let reverting = matches!(follow, FollowUp::RevertOne(_) | FollowUp::RevertSection | FollowUp::RevertAll);
     let turn_protection_off = matches!(follow, FollowUp::RevertAll) && backup.restore_point.protection_enabled_by_app;
     if local.is_empty() && admin_ids.is_empty() && !turn_protection_off {
-        ui.set_toast("Nada para fazer aqui.".into());
+        push_toast(&ui, "Nada para fazer aqui.");
         return;
     }
     let log = store::log_path();
     let mut lines = Vec::new();
+    let backup = std::sync::Mutex::new(backup);
     with_backend(host, |sys| {
-        let ctx = ReadCache { disk: disk.as_ref(), disks: admin.disks.as_deref(), security: admin.security.as_ref() };
+        let ctx = read_cache(disk.as_ref(), &admin, tier);
+        let mut backup = backup.lock().expect("backup");
         let results = if reverting {
             engine::revert_ids(sys, &backup, &local, Some(&log))
         } else {
-            engine::apply_ids(sys, &ctx, &backup, &local, Some(&log))
+            engine::apply_ids(sys, &ctx, &mut backup, &local, Some(&log))
         };
         for result in results {
             lines.push(match result {
@@ -618,6 +717,10 @@ fn run_follow(ui: &MainWindow, host: &Arc<Host>, session: &Arc<Mutex<Session>>, 
             }
         }
     });
+    let backup = backup.into_inner().expect("backup");
+    if store::save_backup(&store::backup_path(), &backup).is_ok() {
+        session.lock().expect("sessão").backup = Some(backup);
+    }
     if local.iter().any(|id| id == "g-hz") && !reverting && lines.iter().any(|l| !l.contains("não confirmou") && !l.contains("restaurou")) {
         arm_hz_confirm(ui, host, session);
     }
@@ -627,7 +730,7 @@ fn run_follow(ui: &MainWindow, host: &Arc<Host>, session: &Arc<Mutex<Session>>, 
             Err(err) => lines.push(err),
         }
     }
-    ui.set_toast(lines.join(" ").into());
+    push_toast(&ui, &lines.join(" "));
     refresh(ui, host, session, true);
     ui.set_log_text(read_log_text().into());
 }
@@ -657,7 +760,7 @@ fn arm_hz_confirm(ui: &MainWindow, host: &Arc<Host>, session: &Arc<Mutex<Session
             session.lock().expect("sessão").pending = Pending::None;
             ui.set_dialog_open(false);
             run_follow(&ui, &host, &session, FollowUp::RevertOne("g-hz".into()));
-            ui.set_toast("15 segundos sem confirmação. Taxa anterior restaurada.".into());
+            push_toast(&ui, "15 segundos sem confirmação. Taxa anterior restaurada.");
         });
     });
 }
@@ -670,7 +773,7 @@ fn read_as_admin(ui: &MainWindow, host: &Host, session: &Mutex<Session>) {
             fake.elevated = true;
             fake.deny_admin_reads = false;
         }
-        ui.set_toast("Leitura de administrador simulada.".into());
+        push_toast(&ui, "Leitura de administrador simulada.");
         refresh(ui, host, session, true);
     }
     #[cfg(windows)]
@@ -678,15 +781,15 @@ fn read_as_admin(ui: &MainWindow, host: &Host, session: &Mutex<Session>) {
         let result = store::data_dir().join("admin-cache.json");
         let args = format!("--read-admin --result \"{}\"", result.display());
         if !elevate_command(&args) {
-            ui.set_toast("Elevação cancelada. Nada foi lido como admin.".into());
+            push_toast(&ui, "Elevação cancelada. Nada foi lido como admin.");
             return;
         }
         if wait_file(&result, Duration::from_secs(40)) {
             session.lock().expect("sessão").admin = store::load_admin_cache(&result);
             refresh(ui, host, session, true);
-            ui.set_toast("Leitura de administrador concluída.".into());
+            push_toast(&ui, "Leitura de administrador concluída.");
         } else {
-            ui.set_toast("A leitura elevada não devolveu resultado.".into());
+            push_toast(&ui, "A leitura elevada não devolveu resultado.");
         }
     }
 }
@@ -732,7 +835,7 @@ fn spawn_disk_sample(ui: slint::Weak<MainWindow>, host: Arc<Host>, session: Arc<
         let _ = ui.upgrade_in_event_loop(move |ui| {
             ui.set_busy(false);
             if let Some(err) = error {
-                ui.set_toast(err.into());
+                push_toast(&ui, &err);
                 return;
             }
             if let Some(report) = report {
@@ -757,8 +860,8 @@ fn spawn_update_check(ui: slint::Weak<MainWindow>, manual: bool) {
                 ui.set_update_body(body.into());
                 ui.set_update_open(true);
             }
-            Ok(None) if manual => ui.set_toast("Você já está na versão mais recente.".into()),
-            Err(err) if manual => ui.set_toast(err.into()),
+            Ok(None) if manual => push_toast(&ui, "Você já está na versão mais recente."),
+            Err(err) if manual => push_toast(&ui, &err),
             _ => {}
         });
     });
@@ -860,13 +963,15 @@ fn run_apply_batch(batch_path: &Path, result_path: Option<&str>) -> i32 {
         write_result(result_path, vec!["Backup não encontrado.".into()]);
         return 3;
     };
+    let backup = std::sync::Mutex::new(backup);
     let mut lines = Vec::new();
     let ran = with_backend_result(|sys| {
         let ctx = ReadCache::empty();
+        let mut backup = backup.lock().expect("backup");
         let results: Vec<Result<ApplyOutcome, String>> = if revert {
             engine::revert_ids(sys, &backup, &ids, Some(&store::log_path()))
         } else {
-            engine::apply_ids(sys, &ctx, &backup, &ids, Some(&store::log_path()))
+            engine::apply_ids(sys, &ctx, &mut backup, &ids, Some(&store::log_path()))
         };
         for result in results {
             lines.push(match result {
@@ -877,6 +982,9 @@ fn run_apply_batch(batch_path: &Path, result_path: Option<&str>) -> i32 {
     });
     if let Err(err) = ran {
         lines.push(err);
+    }
+    if let Ok(backup) = backup.into_inner() {
+        let _ = store::save_backup(&store::backup_path(), &backup);
     }
     write_result(result_path, lines);
     0
@@ -1013,7 +1121,12 @@ fn card_from(view: ItemView, elevated: bool) -> Card {
     let kind = match view.state {
         ItemState::Ok => "ok",
         ItemState::CanImprove => "improve",
+        ItemState::NotApplicable => "na",
         ItemState::NotRead | ItemState::NeedsAdmin => "unread",
+    };
+    let seal = match view.seal {
+        turbo::model::Seal::Seguro => "Seguro",
+        turbo::model::Seal::Ressalva => "Com ressalva",
     };
     Card {
         id: view.id.clone().into(),
@@ -1021,7 +1134,7 @@ fn card_from(view: ItemView, elevated: bool) -> Card {
         faz: view.faz.into(),
         ajuda: view.ajuda.into(),
         detail: view.detail.into(),
-        seal: view.seal.label().into(),
+        seal: seal.into(),
         caveat: view.caveat.into(),
         admin: view.admin.into(),
         reboot: view.reinicio.into(),
@@ -1038,20 +1151,57 @@ fn card_from(view: ItemView, elevated: bool) -> Card {
 
 fn fill_nav(ui: &MainWindow, session: &Mutex<Session>) {
     let views = session.lock().expect("sessão").views.clone();
-    let mut entries = vec![NavEntry { id: "home".into(), label: "Início".into(), hint: "".into() }];
+    let mut entries = vec![nav_entry("home", "Início", "", "home", "Otimizar")];
     for section in Section::all() {
         let improve = views.iter().filter(|v| v.section == *section && v.state == ItemState::CanImprove).count();
-        entries.push(NavEntry {
-            id: section.id().into(),
-            label: section.label().into(),
-            hint: if improve == 0 { "".into() } else { improve.to_string().into() },
-        });
+        let hint = if improve == 0 { String::new() } else { improve.to_string() };
+        entries.push(nav_entry(section.id(), section.label(), &hint, section_icon(section.id()), ""));
     }
-    entries.push(NavEntry { id: "manual".into(), label: "Checklist manual".into(), hint: "".into() });
-    entries.push(NavEntry { id: "limites".into(), label: "O que não fazemos".into(), hint: "".into() });
-    entries.push(NavEntry { id: "log".into(), label: "Log".into(), hint: "".into() });
-    entries.push(NavEntry { id: "sobre".into(), label: "Sobre".into(), hint: "".into() });
+    entries.push(nav_entry("manual", "Checklist manual", "", "list", "Ferramentas"));
+    entries.push(nav_entry("log", "Log", "", "log", ""));
+    entries.push(nav_entry("limites", "O que não fazemos", "", "info", "Info"));
+    entries.push(nav_entry("sobre", "Sobre", "", "info", ""));
     ui.set_nav(model(entries));
+}
+
+fn nav_entry(id: &str, label: &str, hint: &str, icon: &str, header: &str) -> NavEntry {
+    NavEntry { id: id.into(), label: label.into(), hint: hint.into(), icon: icon.into(), header: header.into() }
+}
+
+fn section_icon(id: &str) -> &'static str {
+    match id {
+        "disco" => "disk",
+        "desempenho" => "bolt",
+        "mouse" => "mouse",
+        "teclado" => "keyboard",
+        "monitor" => "monitor",
+        "rede" => "net",
+        "servicos" => "service",
+        "inicio" => "startup",
+        "privacidade" => "shield",
+        "jogos" => "game",
+        _ => "home",
+    }
+}
+
+fn section_blurb(id: &str) -> &'static str {
+    match id {
+        "disco" => "O que o disco está fazendo. Saúde e local do Windows são só leitura.",
+        "desempenho" => "Gravação, Modo de Jogo e o plano de energia. O plano melhor não é trocado por um pior.",
+        "mouse" => "Aceleração e a velocidade do ponteiro, no valor exato recomendado.",
+        "teclado" => "O atalho que liga as Teclas de Aderência no meio da partida.",
+        "monitor" => "Taxa do monitor e o flip model do DirectX. Só sobe, nunca reduz.",
+        "rede" => "Economia de energia da placa cabeada, pelo RegistryKeyword. Sem placa, o item não se aplica.",
+        "servicos" => "Spooler só quando não há impressora. Serviço ausente não é erro.",
+        "inicio" => "O que abre com o Windows. Lista vazia não é pendência.",
+        "privacidade" => "Telemetria e anúncios. AllowTelemetry 0 já é mais restrito e fica como está.",
+        "jogos" => "Vanguard fica de fora. O item só explica.",
+        "manual" => "O que o Turbo não mexe e ainda vale conferir na mão.",
+        "limites" => "O que fica de fora de propósito, incluindo roteamento pago.",
+        "log" => "Passo a passo de cada Otimizar e Reverter, com o erro quando falha.",
+        "sobre" => "Como o app lê o Windows e onde ficam backup e log.",
+        _ => "",
+    }
 }
 
 fn critical_text(views: &[ItemView]) -> String {
@@ -1082,12 +1232,42 @@ fn read_log_text() -> String {
 }
 
 fn open_dialog(ui: &MainWindow, title: &str, body: &str, primary: &str, secondary: &str, secondary_visible: bool) {
+    ui.set_dialog_alt("".into());
+    ui.set_dialog_alt_visible(false);
     ui.set_dialog_title(title.into());
     ui.set_dialog_body(body.into());
     ui.set_dialog_primary(primary.into());
     ui.set_dialog_secondary(secondary.into());
     ui.set_dialog_secondary_visible(secondary_visible);
     ui.set_dialog_open(true);
+}
+
+fn open_power_dialog(ui: &MainWindow, body: &str) {
+    ui.set_dialog_title("Plano de energia".into());
+    ui.set_dialog_body(body.into());
+    ui.set_dialog_primary("Desempenho Máximo".into());
+    ui.set_dialog_alt("Alto desempenho".into());
+    ui.set_dialog_alt_visible(true);
+    ui.set_dialog_secondary("Cancelar".into());
+    ui.set_dialog_secondary_visible(true);
+    ui.set_dialog_open(true);
+}
+
+fn push_toast(ui: &MainWindow, message: &str) {
+    let lower = message.to_lowercase();
+    let kind = if message.is_empty() {
+        ""
+    } else if lower.contains("falhou") || lower.contains("não ") || lower.contains("erro") || lower.contains("restaurou") {
+        "bad"
+    } else {
+        "ok"
+    };
+    ui.set_toast_kind(kind.into());
+    ui.set_toast(message.into());
+}
+
+fn read_cache<'a>(disk: Option<&'a turbo::model::DiskReport>, admin: &'a AdminCacheFile, tier: PowerTier) -> ReadCache<'a> {
+    ReadCache { disk, disks: admin.disks.as_deref(), security: admin.security.as_ref(), power_tier: tier }
 }
 
 fn model<T: Clone + 'static>(items: Vec<T>) -> ModelRc<T> {

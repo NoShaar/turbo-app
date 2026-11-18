@@ -4,16 +4,18 @@
 use crate::backend::SystemBackend;
 use crate::catalog::meta;
 use crate::model::*;
+use crate::rules::{self, PowerAction, PowerClass};
 
 pub struct ReadCache<'a> {
     pub disk: Option<&'a DiskReport>,
     pub disks: Option<&'a [DiskHealth]>,
     pub security: Option<&'a SecurityStatus>,
+    pub power_tier: PowerTier,
 }
 
 impl<'a> ReadCache<'a> {
     pub fn empty() -> Self {
-        Self { disk: None, disks: None, security: None }
+        Self { disk: None, disks: None, security: None, power_tier: PowerTier::Ultimate }
     }
 }
 
@@ -62,7 +64,7 @@ pub fn capture(id: &str, sys: &dyn SystemBackend) -> Result<ItemSnapshot, Engine
         "i-edge" => Ok(ItemSnapshot::Registry { entries: read_slots(sys, &edge_slots())? }),
         "w-diag" => Ok(ItemSnapshot::Registry { entries: read_slots(sys, &telemetry_slots())? }),
         "w-ads" => Ok(ItemSnapshot::Registry { entries: read_slots(sys, &ads_slots())? }),
-        "p-energia" => Ok(ItemSnapshot::Power { guid: normalize_guid(&sys.power_active()?) }),
+        "p-energia" => Ok(ItemSnapshot::Power { guid: normalize_guid(&sys.power_active()?), created_guid: None }),
         "m-acel" => {
             let m = sys.mouse_accel()?;
             Ok(ItemSnapshot::MouseAccel { threshold1: m.threshold1, threshold2: m.threshold2, enabled: m.enabled })
@@ -95,7 +97,7 @@ pub fn apply(id: &str, sys: &mut dyn SystemBackend, ctx: &ReadCache<'_>) -> Resu
             write_dword(sys, Hive::Hkcu, GAME_BAR, "AutoGameModeEnabled", 1)?;
             Ok("Modo de Jogo gravado como ligado.".into())
         }
-        "p-energia" => apply_power(sys),
+        "p-energia" => apply_power(sys, ctx),
         "m-acel" => {
             sys.set_mouse_accel(MouseAccel { threshold1: 0, threshold2: 0, enabled: 0 })?;
             Ok("Aceleração do ponteiro desligada.".into())
@@ -113,10 +115,7 @@ pub fn apply(id: &str, sys: &mut dyn SystemBackend, ctx: &ReadCache<'_>) -> Resu
             write_dwords(sys, &edge_targets())?;
             Ok("Políticas de segundo plano do Edge gravadas.".into())
         }
-        "w-diag" => {
-            write_dword(sys, Hive::Hklm, TELEMETRY, "AllowTelemetry", 1)?;
-            Ok("Dados de diagnóstico limitados ao nível Obrigatório.".into())
-        }
+        "w-diag" => apply_telemetry(sys),
         "w-ads" => {
             write_dword(sys, Hive::Hkcu, ADS, "Enabled", 0)?;
             Ok("ID de anúncio desligado.".into())
@@ -132,8 +131,15 @@ pub fn revert(id: &str, sys: &mut dyn SystemBackend, snap: &ItemSnapshot) -> Res
             restore_slots(sys, entries)?;
             Ok("Valores originais do registro restaurados.".into())
         }
-        ("p-energia", ItemSnapshot::Power { guid }) => {
+        ("p-energia", ItemSnapshot::Power { guid, created_guid }) => {
+            crate::store::trace(&format!("ação revert p-energia passo voltar para {guid}"));
             sys.power_set_active(guid)?;
+            if let Some(created) = created_guid {
+                if !rules::is_builtin_scheme(created) {
+                    crate::store::trace(&format!("ação revert p-energia passo apagar plano criado {created}"));
+                    sys.power_delete(created)?;
+                }
+            }
             Ok(format!("Plano restaurado: {}.", power_name(guid)))
         }
         ("m-acel", ItemSnapshot::MouseAccel { threshold1, threshold2, enabled }) => {
@@ -166,8 +172,19 @@ pub fn revert(id: &str, sys: &mut dyn SystemBackend, snap: &ItemSnapshot) -> Res
             Ok(format!("{name} voltou para {}.", start.label()))
         }
         ("n-eee", ItemSnapshot::Nic { props }) => {
+            let mut touched = Vec::new();
             for prop in props {
-                sys.set_adapter_keyword(&prop.adapter, &prop.keyword, &prop.value)?;
+                crate::store::trace(&format!(
+                    "ação revert n-eee passo {} guid {} keyword {} = {}",
+                    prop.adapter, prop.interface_guid, prop.keyword, prop.value
+                ));
+                sys.set_adapter_keyword(&prop.adapter, &prop.interface_guid, &prop.keyword, &prop.value)?;
+                touched.push((prop.adapter.clone(), prop.interface_guid.clone()));
+            }
+            touched.sort();
+            touched.dedup();
+            for (adapter, guid) in touched {
+                sys.restart_adapter(&adapter, &guid)?;
             }
             Ok("Economia de energia da placa de rede restaurada.".into())
         }
@@ -350,7 +367,7 @@ fn diag_smart(sys: &dyn SystemBackend, ctx: &ReadCache<'_>) -> Result<Diagnosis,
 
 fn judge_disks(disks: &[DiskHealth]) -> Diagnosis {
     if disks.is_empty() {
-        return Diagnosis { state: ItemState::NotRead, detail: "Nenhum disco físico foi retornado.".into(), offer_apply: false };
+        return Diagnosis { state: ItemState::NotApplicable, detail: "Não se aplica: nenhum disco físico foi encontrado.".into(), offer_apply: false };
     }
     let mut problems = Vec::new();
     let mut lines = Vec::new();
@@ -371,7 +388,7 @@ fn judge_disks(disks: &[DiskHealth]) -> Diagnosis {
             disk.read_errors.map(|n| n.to_string()).unwrap_or_else(|| "n/d".into()),
             disk.write_errors.map(|n| n.to_string()).unwrap_or_else(|| "n/d".into()),
         ));
-        if !disk.health.eq_ignore_ascii_case("Healthy") {
+        if rules::health_is_bad(&disk.health) {
             problems.push(format!("{} não está saudável ({})", disk.name, disk.health));
         }
         if disk.read_errors.unwrap_or(0) > 0 || disk.write_errors.unwrap_or(0) > 0 {
@@ -385,7 +402,7 @@ fn judge_disks(disks: &[DiskHealth]) -> Diagnosis {
         if disk.wear.unwrap_or(0) >= 100 {
             problems.push(format!("{} chegou a 100% de desgaste", disk.name));
         }
-        if disk.read_errors.is_none() || disk.write_errors.is_none() {
+        if disk.read_errors.is_none() && disk.write_errors.is_none() && disk.health.trim().is_empty() && disk.wear.is_none() {
             problems.push(format!("contadores SMART de {} não vieram", disk.name));
         }
     }
@@ -479,7 +496,17 @@ fn diag_onde(sys: &dyn SystemBackend) -> Result<Diagnosis, EngineError> {
 }
 
 fn diag_sysmain(sys: &dyn SystemBackend, ctx: &ReadCache<'_>) -> Result<Diagnosis, EngineError> {
-    let svc = sys.service("SysMain")?;
+    let svc = match sys.service("SysMain") {
+        Ok(svc) => svc,
+        Err(BackendError::NotFound(_)) => {
+            return Ok(Diagnosis {
+                state: ItemState::NotApplicable,
+                detail: "Não se aplica: o serviço SysMain não existe neste Windows.".into(),
+                offer_apply: false,
+            })
+        }
+        Err(err) => return Err(err.into()),
+    };
     let parked = svc.start == StartType::Manual && svc.run == ServiceRun::Stopped;
     if parked {
         return Ok(Diagnosis {
@@ -543,13 +570,49 @@ fn diag_gamemode(sys: &dyn SystemBackend) -> Result<Diagnosis, EngineError> {
 }
 
 fn diag_power(sys: &dyn SystemBackend) -> Result<Diagnosis, EngineError> {
-    let guid = sys.power_active()?;
-    let ok = is_high_or_ultimate(&guid);
+    let active = active_scheme(sys)?;
+    let class = rules::classify_power(&active);
+    let label = scheme_label(&active, class);
+    let mut detail = match class {
+        PowerClass::Ultimate => format!("Plano ativo: {label}. Já é Desempenho Máximo (ou um plano igual). Nada a trocar."),
+        PowerClass::High => format!("Plano ativo: {label}. Alto desempenho já vale. O Turbo não troca por um plano pior."),
+        PowerClass::Balanced => format!("Plano ativo: {label}. Dá para subir para Desempenho Máximo ou, se preferir, Alto desempenho."),
+        PowerClass::Saver => format!("Plano ativo: {label}. Este plano segura o clock. Dá para subir para Desempenho Máximo ou Alto desempenho."),
+        PowerClass::Other => format!("Plano ativo: {label}. Não reconheci como Alto desempenho nem Desempenho Máximo."),
+    };
+    if sys.machine_kind() == MachineKind::Laptop {
+        let where_ = if sys.on_battery() { "Está na bateria agora." } else { "Está na tomada agora." };
+        detail.push_str(&format!(" Notebook: Desempenho Máximo e Alto desempenho gastam mais bateria. {where_}"));
+    }
+    let ok = class.is_good();
     Ok(Diagnosis {
         state: if ok { ItemState::Ok } else { ItemState::CanImprove },
-        detail: format!("Plano ativo: {}.", power_name(&guid)),
+        detail,
         offer_apply: !ok,
     })
+}
+
+fn active_scheme(sys: &dyn SystemBackend) -> Result<PowerSchemeInfo, EngineError> {
+    let guid = normalize_guid(&sys.power_active()?);
+    let schemes = sys.power_schemes()?;
+    Ok(schemes.into_iter().find(|scheme| normalize_guid(&scheme.guid) == guid).unwrap_or(PowerSchemeInfo {
+        guid,
+        name: String::new(),
+        personality: None,
+        disk_timeout_ac: None,
+        min_processor_ac: None,
+    }))
+}
+
+fn scheme_label(scheme: &PowerSchemeInfo, class: PowerClass) -> String {
+    let name = scheme.name.trim();
+    if !name.is_empty() && !name.starts_with('@') {
+        name.to_string()
+    } else if class != PowerClass::Other {
+        class.label().to_string()
+    } else {
+        power_name(&scheme.guid)
+    }
 }
 
 fn diag_mouse_accel(sys: &dyn SystemBackend) -> Result<Diagnosis, EngineError> {
@@ -588,7 +651,7 @@ fn diag_hotkeys(sys: &dyn SystemBackend) -> Result<Diagnosis, EngineError> {
 fn diag_hz(sys: &dyn SystemBackend) -> Result<Diagnosis, EngineError> {
     let info = sys.display()?;
     if info.monitors.is_empty() {
-        return Ok(Diagnosis { state: ItemState::NotRead, detail: "Nenhum monitor encontrado.".into(), offer_apply: false });
+        return Ok(Diagnosis { state: ItemState::NotApplicable, detail: "Não se aplica: nenhum monitor encontrado.".into(), offer_apply: false });
     }
     let mut lines = Vec::new();
     let mut bad = false;
@@ -634,54 +697,51 @@ fn token_is(existing: &str, key: &str, value: &str) -> bool {
     })
 }
 
-fn nic_power_name(name: &str) -> bool {
-    const NAMES: &[&str] = &[
-        "energia eficiente ethernet",
-        "energy-efficient ethernet",
-        "energy efficient ethernet",
-        "power saving mode",
-        "green ethernet",
-    ];
-    NAMES.iter().any(|n| name.eq_ignore_ascii_case(n))
-}
-
-fn wired_power_props(adapters: &[AdapterInfo]) -> Vec<(&str, &NicPowerProp)> {
+fn wired_power_props(adapters: &[AdapterInfo]) -> Vec<(&AdapterInfo, &NicPowerProp)> {
     adapters
         .iter()
         .filter(|a| a.wired)
-        .flat_map(|a| a.power_props.iter().filter(|p| nic_power_name(&p.display_name)).map(move |p| (a.name.as_str(), p)))
+        .flat_map(|a| a.power_props.iter().filter(|p| rules::is_nic_power_keyword(&p.keyword)).map(move |p| (a, p)))
         .collect()
 }
 
 fn diag_nic(sys: &dyn SystemBackend) -> Result<Diagnosis, EngineError> {
-    let adapters = sys.adapters()?;
+    let adapters = match sys.adapters() {
+        Ok(adapters) => adapters,
+        Err(BackendError::NotFound(_)) => {
+            return Ok(Diagnosis {
+                state: ItemState::NotApplicable,
+                detail: "Não se aplica: nenhuma placa de rede.".into(),
+                offer_apply: false,
+            })
+        }
+        Err(err) => return Err(err.into()),
+    };
     let wired: Vec<&AdapterInfo> = adapters.iter().filter(|a| a.wired).collect();
     if wired.is_empty() {
         return Ok(Diagnosis {
-            state: ItemState::Ok,
-            detail: "Nenhuma placa cabeada encontrada. O item não se aplica.".into(),
+            state: ItemState::NotApplicable,
+            detail: "Não se aplica: não há placa cabeada. Wi-Fi não entra neste item.".into(),
             offer_apply: false,
         });
     }
     let props = wired_power_props(&adapters);
     if props.is_empty() {
         return Ok(Diagnosis {
-            state: ItemState::Ok,
-            detail: "A placa cabeada não expõe Energia Eficiente Ethernet, Power Saving Mode nem Green Ethernet.".into(),
+            state: ItemState::NotApplicable,
+            detail: "Não se aplica: a placa cabeada não tem *EEE, PowerSavingMode nem EnableGreenEthernet.".into(),
             offer_apply: false,
         });
     }
     let mut lines = Vec::new();
     let mut bad = false;
     for (adapter, prop) in &props {
-        let off = prop.current == prop.disabled_value
-            || prop.current_display.eq_ignore_ascii_case("desativado")
-            || prop.current_display.eq_ignore_ascii_case("disabled")
-            || prop.current_display.eq_ignore_ascii_case("off");
-        if !off {
+        let on = rules::nic_power_enabled(&prop.current);
+        if on {
             bad = true;
         }
-        lines.push(format!("{adapter} · {} ({}) = {}", prop.display_name, prop.keyword, prop.current_display));
+        let who = if adapter.description.is_empty() { adapter.name.as_str() } else { adapter.description.as_str() };
+        lines.push(format!("{who} · {} = {} (guid {})", prop.keyword, prop.current, adapter.interface_guid));
     }
     Ok(Diagnosis {
         state: if bad { ItemState::CanImprove } else { ItemState::Ok },
@@ -693,19 +753,20 @@ fn diag_nic(sys: &dyn SystemBackend) -> Result<Diagnosis, EngineError> {
 fn diag_link(sys: &dyn SystemBackend) -> Result<Diagnosis, EngineError> {
     let adapters = sys.adapters()?;
     if adapters.is_empty() {
-        return Ok(Diagnosis { state: ItemState::NotRead, detail: "Nenhuma placa de rede encontrada.".into(), offer_apply: false });
+        return Ok(Diagnosis { state: ItemState::NotApplicable, detail: "Não se aplica: nenhuma placa de rede encontrada.".into(), offer_apply: false });
     }
     let mut lines = Vec::new();
     let mut bad = false;
     for adapter in adapters.iter().filter(|a| a.connected) {
         let kind = if adapter.wired { "cabo" } else { "sem fio" };
+        let cap = rules::inferred_link_cap_bps(&adapter.description).unwrap_or(0);
+        let cap_label = if cap > 0 { bps_label(cap) } else { "não identificada".into() };
         lines.push(format!(
-            "{} ({kind}): link {}, máxima {}.",
+            "{} ({kind}): link {}, capacidade {cap_label}.",
             adapter.name,
-            bps_label(adapter.link_bps),
-            bps_label(adapter.max_bps)
+            bps_label(adapter.link_bps)
         ));
-        if adapter.wired && adapter.max_bps > 0 && adapter.link_bps > 0 && adapter.link_bps < adapter.max_bps {
+        if adapter.wired && cap > adapter.link_bps && adapter.link_bps > 0 {
             bad = true;
         }
     }
@@ -721,7 +782,17 @@ fn diag_link(sys: &dyn SystemBackend) -> Result<Diagnosis, EngineError> {
 
 fn diag_spooler(sys: &dyn SystemBackend) -> Result<Diagnosis, EngineError> {
     let printers = sys.physical_printers()?;
-    let svc = sys.service("Spooler")?;
+    let svc = match sys.service("Spooler") {
+        Ok(svc) => svc,
+        Err(BackendError::NotFound(_)) => {
+            return Ok(Diagnosis {
+                state: ItemState::NotApplicable,
+                detail: "Não se aplica: o serviço Spooler não existe neste Windows.".into(),
+                offer_apply: false,
+            })
+        }
+        Err(err) => return Err(err.into()),
+    };
     if printers.is_empty() {
         let ok = svc.start == StartType::Disabled && svc.run == ServiceRun::Stopped;
         return Ok(Diagnosis {
@@ -746,7 +817,7 @@ fn diag_spooler(sys: &dyn SystemBackend) -> Result<Diagnosis, EngineError> {
 fn diag_startup(sys: &dyn SystemBackend) -> Result<Diagnosis, EngineError> {
     let entries = sys.startup_entries()?;
     if entries.is_empty() {
-        return Ok(Diagnosis { state: ItemState::Ok, detail: "Nenhum item de inicialização encontrado.".into(), offer_apply: true });
+        return Ok(Diagnosis { state: ItemState::NotApplicable, detail: "Não se aplica: nenhum item de inicialização.".into(), offer_apply: false });
     }
     let mut lines = Vec::new();
     let mut actionable = 0;
@@ -782,10 +853,13 @@ fn diag_edge(sys: &dyn SystemBackend) -> Result<Diagnosis, EngineError> {
 
 fn diag_telemetry(sys: &dyn SystemBackend) -> Result<Diagnosis, EngineError> {
     let value = dword(sys, Hive::Hklm, TELEMETRY, "AllowTelemetry")?;
-    let ok = value == Some(1);
+    // 0 é mais restrito que o alvo (1). Subir de 0 para 1 piora a privacidade.
+    let ok = matches!(value, Some(0) | Some(1));
     let detail = match value {
         None => "AllowTelemetry ausente. O app grava 1 (Obrigatório), o mínimo do Windows Pro.".into(),
-        Some(v) => format!("AllowTelemetry = {v}."),
+        Some(0) => "AllowTelemetry = 0, mais restrito que o Obrigatório. O Turbo não aumenta a telemetria.".into(),
+        Some(1) => "AllowTelemetry = 1 (Obrigatório).".into(),
+        Some(v) => format!("AllowTelemetry = {v}. Dá para limitar a 1."),
     };
     Ok(Diagnosis {
         state: if ok { ItemState::Ok } else { ItemState::CanImprove },
@@ -872,17 +946,42 @@ fn apply_spooler(sys: &mut dyn SystemBackend) -> Result<String, EngineError> {
     Ok("Spooler parado e desativado.".into())
 }
 
-fn apply_power(sys: &mut dyn SystemBackend) -> Result<String, EngineError> {
-    let current = sys.power_active()?;
-    if is_high_or_ultimate(&current) {
-        return Ok(format!("O plano já é {}.", power_name(&current)));
+fn apply_telemetry(sys: &mut dyn SystemBackend) -> Result<String, EngineError> {
+    match dword(sys, Hive::Hklm, TELEMETRY, "AllowTelemetry")? {
+        Some(0) | Some(1) => Ok("Telemetria já está em 0 ou 1. Nada foi alterado.".into()),
+        _ => {
+            write_dword(sys, Hive::Hklm, TELEMETRY, "AllowTelemetry", 1)?;
+            Ok("Dados de diagnóstico limitados ao nível Obrigatório.".into())
+        }
     }
-    if !is_saver_or_balanced(&current) {
-        // Plano personalizado não está na lista de OK. A spec manda o alto desempenho
-        // quando o ativo não é Alto desempenho nem Desempenho Máximo.
+}
+
+fn apply_power(sys: &mut dyn SystemBackend, ctx: &ReadCache<'_>) -> Result<String, EngineError> {
+    let active = active_scheme(sys)?;
+    let schemes = sys.power_schemes()?;
+    let action = rules::plan_power(&active, &schemes, ctx.power_tier);
+    crate::store::trace(&format!("ação p-energia plano ativo {} classe {:?} tier {:?}", active.guid, rules::classify_power(&active), ctx.power_tier));
+    match action {
+        PowerAction::AlreadyGood => Ok(format!("O plano já é {}. Não vou rebaixar.", scheme_label(&active, rules::classify_power(&active)))),
+        PowerAction::Activate(guid) => {
+            crate::store::trace(&format!("ação p-energia passo ativar {guid}"));
+            sys.power_set_active(&guid)?;
+            Ok(format!("Plano ativado: {}.", power_name(&guid)))
+        }
+        PowerAction::Duplicate(source) => {
+            crate::store::trace(&format!("ação p-energia passo duplicatescheme {source}"));
+            let created = sys.power_duplicate(&source)?;
+            crate::store::trace(&format!("ação p-energia plano criado {created}"));
+            if let Err(err) = sys.power_set_active(&created) {
+                crate::store::trace(&format!("ação p-energia falhou ao ativar {created}: {err}"));
+                let _ = sys.power_delete(&created);
+                return Err(err.into());
+            }
+            sys.note_created_power_scheme(&created);
+            let label = if rules::guids_equal(&source, ULTIMATE_PERFORMANCE_GUID) { "Desempenho Máximo" } else { "Alto desempenho" };
+            Ok(format!("{label} criado ({created}) e ativado. Reverter volta ao plano anterior e apaga só este."))
+        }
     }
-    sys.power_set_active(HIGH_PERFORMANCE_GUID)?;
-    Ok("Plano Alto desempenho ativado.".into())
 }
 
 fn apply_hotkeys(sys: &mut dyn SystemBackend) -> Result<String, EngineError> {
@@ -923,21 +1022,27 @@ fn apply_dx(sys: &mut dyn SystemBackend) -> Result<String, EngineError> {
 
 fn apply_nic(sys: &mut dyn SystemBackend) -> Result<String, EngineError> {
     let adapters = sys.adapters()?;
-    let mut n = 0;
-    let props: Vec<(String, String, String)> = wired_power_props(&adapters)
+    let props: Vec<(String, String, String, String)> = wired_power_props(&adapters)
         .into_iter()
-        .filter(|(_, p)| p.current != p.disabled_value)
-        .map(|(a, p)| (a.to_string(), p.keyword.clone(), p.disabled_value.clone()))
+        .filter(|(_, prop)| rules::nic_power_enabled(&prop.current))
+        .map(|(adapter, prop)| (adapter.name.clone(), adapter.interface_guid.clone(), prop.keyword.clone(), prop.disabled_value.clone()))
         .collect();
-    for (adapter, keyword, value) in props {
-        sys.set_adapter_keyword(&adapter, &keyword, &value)?;
-        n += 1;
+    if props.is_empty() {
+        return Ok("Não se aplica: nenhuma propriedade de economia de energia cabeada para desligar.".into());
     }
-    if n == 0 {
-        Ok("Nada para desligar na placa cabeada.".into())
-    } else {
-        Ok(format!("{n} propriedade(s) de economia de energia desligada(s). A rede pode cair por alguns segundos."))
+    let mut touched = Vec::new();
+    for (adapter, guid, keyword, value) in &props {
+        crate::store::trace(&format!("ação n-eee passo gravar {adapter} guid {guid} {keyword}={value}"));
+        sys.set_adapter_keyword(adapter, guid, keyword, value)?;
+        touched.push((adapter.clone(), guid.clone()));
     }
+    touched.sort();
+    touched.dedup();
+    for (adapter, guid) in &touched {
+        crate::store::trace(&format!("ação n-eee passo reiniciar {adapter} guid {guid}"));
+        sys.restart_adapter(adapter, guid)?;
+    }
+    Ok(format!("{} propriedade(s) desligada(s) pelo RegistryKeyword. A rede pode cair por alguns segundos.", props.len()))
 }
 
 fn apply_startup(sys: &mut dyn SystemBackend) -> Result<String, EngineError> {
@@ -968,7 +1073,8 @@ fn capture_nic(sys: &dyn SystemBackend) -> Result<ItemSnapshot, EngineError> {
     let props = wired_power_props(&adapters)
         .into_iter()
         .map(|(adapter, prop)| NicSnap {
-            adapter: adapter.to_string(),
+            adapter: adapter.name.clone(),
+            interface_guid: adapter.interface_guid.clone(),
             keyword: prop.keyword.clone(),
             value: prop.current.clone(),
         })

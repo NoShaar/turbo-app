@@ -203,8 +203,15 @@ fn can_revert(sys: &dyn SystemBackend, backup: Option<&BackupFile>, id: &str) ->
         return false;
     };
     match tweaks::capture(id, sys) {
-        Ok(current) => &current != snap,
+        Ok(current) => !snapshots_equivalent(&current, snap),
         Err(_) => true,
+    }
+}
+
+fn snapshots_equivalent(current: &ItemSnapshot, saved: &ItemSnapshot) -> bool {
+    match (current, saved) {
+        (ItemSnapshot::Power { guid: left, .. }, ItemSnapshot::Power { guid: right, .. }) => left == right,
+        _ => current == saved,
     }
 }
 
@@ -256,41 +263,60 @@ pub fn plan_revert(sys: &dyn SystemBackend, ctx: &ReadCache<'_>, backup: Option<
 pub fn apply_one(
     sys: &mut dyn SystemBackend,
     ctx: &ReadCache<'_>,
-    backup: &BackupFile,
+    backup: &mut BackupFile,
     id: &str,
     log_path: Option<&Path>,
 ) -> Result<ApplyOutcome, EngineError> {
     let item = meta(id).ok_or_else(|| EngineError::Message(format!("item desconhecido: {id}")))?;
+    crate::store::trace(&format!("ação apply {id} início"));
     if item.readonly {
-        return Err(EngineError::ReadOnly);
+        let err = EngineError::ReadOnly;
+        let _ = write_log(log_path, id, "apply", false, &err.to_string(), &(), &());
+        return Err(err);
     }
     if backup.snapshot(id).is_none() {
-        return Err(EngineError::BackupRequired);
+        let err = EngineError::BackupRequired;
+        crate::store::trace(&format!("ação apply {id} falhou: {err}"));
+        let _ = write_log(log_path, id, "apply", false, &err.to_string(), &(), &());
+        return Err(err);
     }
     if tweaks::requires_admin(id, sys)? && !sys.is_elevated() {
-        return Err(EngineError::NeedsAdmin);
+        let err = EngineError::NeedsAdmin;
+        crate::store::trace(&format!("ação apply {id} falhou: {err}"));
+        let _ = write_log(log_path, id, "apply", false, &err.to_string(), &(), &());
+        return Err(err);
     }
     let before = tweaks::capture(id, sys)?;
     let message = match tweaks::apply(id, sys, ctx) {
         Ok(message) => message,
         Err(err) => {
+            crate::store::trace(&format!("ação apply {id} falhou: {err}"));
             let _ = write_log(log_path, id, "apply", false, &err.to_string(), &before, &before);
             return Err(err);
         }
     };
+    if let Some(created) = sys.take_created_power_scheme() {
+        if let Some(item) = backup.items.iter_mut().find(|item| item.id == id) {
+            if let ItemSnapshot::Power { created_guid, .. } = &mut item.snapshot {
+                *created_guid = Some(created);
+            }
+        }
+    }
     let after_view = tweaks::diagnose(id, sys, ctx)?;
-    if after_view.state != ItemState::Ok {
-        if let Some(snap) = backup.snapshot(id) {
-            let _ = tweaks::revert(id, sys, snap);
+    if !after_view.state.settled() {
+        if let Some(snap) = backup.snapshot(id).cloned() {
+            let _ = tweaks::revert(id, sys, &snap);
         }
         let err = EngineError::Message(format!(
             "Depois de aplicar, a leitura não confirmou o esperado ({}). O Turbo restaurou o valor original.",
             after_view.detail.lines().next().unwrap_or("")
         ));
+        crate::store::trace(&format!("ação apply {id} falhou: {err}"));
         let _ = write_log(log_path, id, "apply", false, &err.to_string(), &before, &before);
         return Err(err);
     }
     let after = tweaks::capture(id, sys).unwrap_or(before.clone());
+    crate::store::trace(&format!("ação apply {id} ok: {message}"));
     let _ = write_log(log_path, id, "apply", true, &message, &before, &after);
     Ok(ApplyOutcome { id: id.to_string(), ok: true, message })
 }
@@ -305,14 +331,24 @@ pub fn revert_one(
     if tweaks::requires_admin(id, sys)? && !sys.is_elevated() {
         return Err(EngineError::NeedsAdmin);
     }
+    crate::store::trace(&format!("ação revert {id} início"));
     let before = tweaks::capture(id, sys).ok();
-    let message = tweaks::revert(id, sys, snap)?;
+    let message = match tweaks::revert(id, sys, snap) {
+        Ok(message) => message,
+        Err(err) => {
+            crate::store::trace(&format!("ação revert {id} falhou: {err}"));
+            let _ = write_log(log_path, id, "revert", false, &err.to_string(), &before, &before);
+            return Err(err);
+        }
+    };
     let after = tweaks::capture(id, sys)?;
-    if &after != snap {
+    if !snapshots_equivalent(&after, snap) {
         let err = EngineError::Message("A reversão não confirmou o valor original. Nada mais foi alterado por este item.".into());
+        crate::store::trace(&format!("ação revert {id} falhou: {err}"));
         let _ = write_log(log_path, id, "revert", false, &err.to_string(), &before, &after);
         return Err(err);
     }
+    crate::store::trace(&format!("ação revert {id} ok: {message}"));
     let _ = write_log(log_path, id, "revert", true, &message, &before, &after);
     Ok(ApplyOutcome { id: id.to_string(), ok: true, message })
 }
@@ -320,7 +356,7 @@ pub fn revert_one(
 pub fn apply_ids(
     sys: &mut dyn SystemBackend,
     ctx: &ReadCache<'_>,
-    backup: &BackupFile,
+    backup: &mut BackupFile,
     ids: &[String],
     log_path: Option<&Path>,
 ) -> Vec<Result<ApplyOutcome, String>> {
@@ -344,7 +380,13 @@ fn write_log(path: Option<&Path>, id: &str, action: &str, ok: bool, message: &st
     let Some(path) = path else {
         return Ok(());
     };
-    store::log_change(path, id, action, ok, message, before, after)
+    match store::log_change(path, id, action, ok, message, before, after) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            crate::store::trace(&format!("não gravei log.jsonl de {action} {id}: {err}"));
+            Err(err)
+        }
+    }
 }
 
 pub fn backup_log_entry(backup: &BackupFile) -> LogEntry {
@@ -367,6 +409,7 @@ mod tests {
     use super::*;
     use crate::fake::FakeBackend;
     use crate::model::Hive;
+    use crate::rules;
     use std::time::{Duration, SystemTime};
 
     fn ready() -> FakeBackend {
@@ -391,7 +434,7 @@ mod tests {
     #[test]
     fn apply_without_backup_is_refused() {
         let mut sys = ready();
-        let err = apply_one(&mut sys, &ReadCache::empty(), &BackupFile {
+        let mut empty = BackupFile {
             version: 1,
             app_version: "1.0.0".into(),
             created_at: String::new(),
@@ -403,7 +446,8 @@ mod tests {
                 protection_enabled_by_app: false,
             },
             items: vec![],
-        }, "p-dvr", None).unwrap_err();
+        };
+        let err = apply_one(&mut sys, &ReadCache::empty(), &mut empty, "p-dvr", None).unwrap_err();
         assert!(matches!(err, EngineError::BackupRequired));
         assert!(sys.reg_get(Hive::Hkcu, r"System\GameConfigStore", "GameDVR_Enabled").unwrap().is_some());
     }
@@ -414,7 +458,7 @@ mod tests {
         // Modo de Jogo ausente é OK e não seria aplicado. Forçamos um valor 0
         // para o apply criar a chave e o revert apagar.
         sys.put(Hive::Hkcu, r"Software\Microsoft\GameBar", "AutoGameModeEnabled", RegValue::Dword(0));
-        let backup = backup_of(&mut sys);
+        let mut backup = backup_of(&mut sys);
         let snap = backup.snapshot("p-gamemode").unwrap();
         match snap {
             ItemSnapshot::Registry { entries } => {
@@ -422,7 +466,7 @@ mod tests {
             }
             other => panic!("snapshot inesperado: {other:?}"),
         }
-        apply_one(&mut sys, &ReadCache::empty(), &backup, "p-gamemode", None).unwrap();
+        apply_one(&mut sys, &ReadCache::empty(), &mut backup, "p-gamemode", None).unwrap();
         assert_eq!(
             sys.reg_get(Hive::Hkcu, r"Software\Microsoft\GameBar", "AutoGameModeEnabled").unwrap(),
             Some(RegValue::Dword(1))
@@ -439,19 +483,19 @@ mod tests {
                 }],
             };
         }
-        revert_one(&mut sys, &backup, "p-gamemode", None).unwrap();
+        revert_one(&mut sys, &mut backup, "p-gamemode", None).unwrap();
         assert_eq!(sys.reg_get(Hive::Hkcu, r"Software\Microsoft\GameBar", "AutoGameModeEnabled").unwrap(), None);
     }
 
     #[test]
     fn game_dvr_apply_and_revert_roundtrip() {
         let mut sys = ready();
-        let backup = backup_of(&mut sys);
-        apply_one(&mut sys, &ReadCache::empty(), &backup, "p-dvr", None).unwrap();
+        let mut backup = backup_of(&mut sys);
+        apply_one(&mut sys, &ReadCache::empty(), &mut backup, "p-dvr", None).unwrap();
         let view = view_one(&mut sys, &ReadCache::empty(), Some(&backup), "p-dvr").unwrap();
         assert_eq!(view.state, ItemState::Ok);
         assert!(view.can_revert);
-        revert_one(&mut sys, &backup, "p-dvr", None).unwrap();
+        revert_one(&mut sys, &mut backup, "p-dvr", None).unwrap();
         let again = view_one(&mut sys, &ReadCache::empty(), Some(&backup), "p-dvr").unwrap();
         assert_eq!(again.state, ItemState::CanImprove);
         assert!(!again.can_revert);
@@ -544,16 +588,16 @@ mod tests {
     #[test]
     fn mouse_accel_and_hotkeys_roundtrip() {
         let mut sys = ready();
-        let backup = backup_of(&mut sys);
-        apply_one(&mut sys, &ReadCache::empty(), &backup, "m-acel", None).unwrap();
+        let mut backup = backup_of(&mut sys);
+        apply_one(&mut sys, &ReadCache::empty(), &mut backup, "m-acel", None).unwrap();
         assert_eq!(sys.mouse_accel().unwrap(), MouseAccel { threshold1: 0, threshold2: 0, enabled: 0 });
-        revert_one(&mut sys, &backup, "m-acel", None).unwrap();
+        revert_one(&mut sys, &mut backup, "m-acel", None).unwrap();
         assert_eq!(sys.mouse_accel().unwrap(), MouseAccel { threshold1: 6, threshold2: 10, enabled: 1 });
 
-        apply_one(&mut sys, &ReadCache::empty(), &backup, "k-atalhos", None).unwrap();
+        apply_one(&mut sys, &ReadCache::empty(), &mut backup, "k-atalhos", None).unwrap();
         assert_eq!(sys.sticky_flags().unwrap(), 506);
         assert_eq!(sys.filter_flags().unwrap() & HOTKEY_ACTIVE, 0);
-        revert_one(&mut sys, &backup, "k-atalhos", None).unwrap();
+        revert_one(&mut sys, &mut backup, "k-atalhos", None).unwrap();
         assert_eq!(sys.sticky_flags().unwrap(), 510);
     }
 
@@ -566,8 +610,8 @@ mod tests {
             "DirectXUserGlobalSettings",
             RegValue::Sz("AutoHDREnable=1;".into()),
         );
-        let backup = backup_of(&mut sys);
-        apply_one(&mut sys, &ReadCache::empty(), &backup, "g-janela", None).unwrap();
+        let mut backup = backup_of(&mut sys);
+        apply_one(&mut sys, &ReadCache::empty(), &mut backup, "g-janela", None).unwrap();
         match sys.reg_get(Hive::Hkcu, r"Software\Microsoft\DirectX\UserGpuPreferences", "DirectXUserGlobalSettings").unwrap() {
             Some(RegValue::Sz(s)) => {
                 assert!(s.contains("AutoHDREnable=1"));
@@ -575,7 +619,7 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
-        revert_one(&mut sys, &backup, "g-janela", None).unwrap();
+        revert_one(&mut sys, &mut backup, "g-janela", None).unwrap();
         match sys.reg_get(Hive::Hkcu, r"Software\Microsoft\DirectX\UserGpuPreferences", "DirectXUserGlobalSettings").unwrap() {
             Some(RegValue::Sz(s)) => assert_eq!(s, "AutoHDREnable=1;"),
             other => panic!("{other:?}"),
@@ -585,9 +629,9 @@ mod tests {
     #[test]
     fn startup_never_deletes_run_entries_and_skips_protected() {
         let mut sys = ready();
-        let backup = backup_of(&mut sys);
+        let mut backup = backup_of(&mut sys);
         let before = sys.startup_entries().unwrap();
-        apply_one(&mut sys, &ReadCache::empty(), &backup, "i-run", None).unwrap();
+        apply_one(&mut sys, &ReadCache::empty(), &mut backup, "i-run", None).unwrap();
         let after = sys.startup_entries().unwrap();
         assert_eq!(after.len(), before.len());
         let opera = after.iter().find(|e| e.name.contains("Opera")).unwrap();
@@ -596,7 +640,7 @@ mod tests {
         assert!(health.enabled(), "Segurança do Windows continua");
         let audio = after.iter().find(|e| e.name == "RTHDVCPL").unwrap();
         assert!(audio.enabled(), "driver de áudio continua");
-        revert_one(&mut sys, &backup, "i-run", None).unwrap();
+        revert_one(&mut sys, &mut backup, "i-run", None).unwrap();
         let restored = sys.startup_entries().unwrap();
         assert!(restored.iter().find(|e| e.name.contains("Opera")).unwrap().enabled());
     }
@@ -605,8 +649,8 @@ mod tests {
     fn spooler_is_not_touched_when_a_printer_exists() {
         let mut sys = ready();
         sys.printers = vec!["HP LaserJet".into()];
-        let backup = backup_of(&mut sys);
-        let err = apply_one(&mut sys, &ReadCache::empty(), &backup, "s-spooler", None).unwrap_err();
+        let mut backup = backup_of(&mut sys);
+        let err = apply_one(&mut sys, &ReadCache::empty(), &mut backup, "s-spooler", None).unwrap_err();
         assert!(err.to_string().contains("impressora"));
         assert_eq!(sys.service("Spooler").unwrap().start, StartType::Auto);
         let plan = plan_optimize(&sys, &ReadCache::empty(), Some(Section::Servicos)).unwrap();
@@ -616,12 +660,12 @@ mod tests {
     #[test]
     fn spooler_disable_and_revert_when_there_is_no_printer() {
         let mut sys = ready();
-        let backup = backup_of(&mut sys);
-        apply_one(&mut sys, &ReadCache::empty(), &backup, "s-spooler", None).unwrap();
+        let mut backup = backup_of(&mut sys);
+        apply_one(&mut sys, &ReadCache::empty(), &mut backup, "s-spooler", None).unwrap();
         let svc = sys.service("Spooler").unwrap();
         assert_eq!(svc.start, StartType::Disabled);
         assert_eq!(svc.run, ServiceRun::Stopped);
-        revert_one(&mut sys, &backup, "s-spooler", None).unwrap();
+        revert_one(&mut sys, &mut backup, "s-spooler", None).unwrap();
         let svc = sys.service("Spooler").unwrap();
         assert_eq!(svc.start, StartType::Auto);
         assert_eq!(svc.run, ServiceRun::Running);
@@ -630,12 +674,12 @@ mod tests {
     #[test]
     fn sysmain_stays_out_of_section_optimize_and_refuses_without_evidence() {
         let mut sys = ready();
-        let ctx = ReadCache { disk: Some(&sys.disk_report.clone()), disks: None, security: None };
+        let ctx = ReadCache { disk: Some(&sys.disk_report.clone()), disks: None, security: None, power_tier: PowerTier::Ultimate };
         let plan = plan_optimize(&sys, &ctx, Some(Section::Disco)).unwrap();
         assert!(!plan.local.iter().any(|id| id == "d-sysmain"));
         assert!(!plan.needs_admin.iter().any(|id| id == "d-sysmain"));
-        let backup = backup_of(&mut sys);
-        let err = apply_one(&mut sys, &ctx, &backup, "d-sysmain", None).unwrap_err();
+        let mut backup = backup_of(&mut sys);
+        let err = apply_one(&mut sys, &ctx, &mut backup, "d-sysmain", None).unwrap_err();
         assert!(err.to_string().contains("não altera"));
         assert_eq!(sys.service("SysMain").unwrap().start, StartType::Auto);
     }
@@ -644,13 +688,13 @@ mod tests {
     fn sysmain_can_be_parked_only_when_it_is_the_top_hdd_user() {
         let mut sys = ready();
         sys.disk_report.sysmain_is_top_on_hdd = true;
-        let ctx = ReadCache { disk: Some(&sys.disk_report.clone()), disks: None, security: None };
-        let backup = backup_of(&mut sys);
-        apply_one(&mut sys, &ctx, &backup, "d-sysmain", None).unwrap();
+        let ctx = ReadCache { disk: Some(&sys.disk_report.clone()), disks: None, security: None, power_tier: PowerTier::Ultimate };
+        let mut backup = backup_of(&mut sys);
+        apply_one(&mut sys, &ctx, &mut backup, "d-sysmain", None).unwrap();
         let svc = sys.service("SysMain").unwrap();
         assert_eq!(svc.start, StartType::Manual);
         assert_eq!(svc.run, ServiceRun::Stopped);
-        revert_one(&mut sys, &backup, "d-sysmain", None).unwrap();
+        revert_one(&mut sys, &mut backup, "d-sysmain", None).unwrap();
         let svc = sys.service("SysMain").unwrap();
         assert_eq!(svc.start, StartType::Auto);
         assert_eq!(svc.run, ServiceRun::Running);
@@ -662,19 +706,25 @@ mod tests {
         let view = view_one(&sys, &ReadCache::empty(), None, "p-energia").unwrap();
         assert_eq!(view.state, ItemState::Ok);
         sys.power = BALANCED_GUID.into();
-        let backup = backup_of(&mut sys);
-        apply_one(&mut sys, &ReadCache::empty(), &backup, "p-energia", None).unwrap();
-        assert_eq!(normalize_guid(&sys.power_active().unwrap()), HIGH_PERFORMANCE_GUID);
-        revert_one(&mut sys, &backup, "p-energia", None).unwrap();
+        let mut backup = backup_of(&mut sys);
+        apply_one(&mut sys, &ReadCache::empty(), &mut backup, "p-energia", None).unwrap();
+        let created = match backup.snapshot("p-energia") {
+            Some(ItemSnapshot::Power { created_guid: Some(guid), .. }) => guid.clone(),
+            other => panic!("o plano criado devia ficar no backup: {other:?}"),
+        };
+        assert_eq!(normalize_guid(&sys.power_active().unwrap()), normalize_guid(&created));
+        assert!(sys.schemes.iter().any(|scheme| normalize_guid(&scheme.guid) == normalize_guid(&created)));
+        revert_one(&mut sys, &mut backup, "p-energia", None).unwrap();
         assert_eq!(normalize_guid(&sys.power_active().unwrap()), BALANCED_GUID);
+        assert!(sys.schemes.iter().all(|scheme| normalize_guid(&scheme.guid) != normalize_guid(&created)));
     }
 
     #[test]
     fn failed_verify_restores_the_original() {
         let mut sys = ready();
-        let backup = backup_of(&mut sys);
+        let mut backup = backup_of(&mut sys);
         sys.fail_writes = true;
-        let err = apply_one(&mut sys, &ReadCache::empty(), &backup, "m-acel", None).unwrap_err();
+        let err = apply_one(&mut sys, &ReadCache::empty(), &mut backup, "m-acel", None).unwrap_err();
         assert!(err.to_string().contains("restaurou"));
         sys.fail_writes = false;
         assert_eq!(sys.mouse_accel().unwrap().enabled, 1);
@@ -683,14 +733,14 @@ mod tests {
     #[test]
     fn revert_all_puts_back_every_changed_item() {
         let mut sys = ready();
-        let backup = backup_of(&mut sys);
+        let mut backup = backup_of(&mut sys);
         for id in ["p-dvr", "m-acel", "k-atalhos", "w-ads"] {
-            apply_one(&mut sys, &ReadCache::empty(), &backup, id, None).unwrap();
+            apply_one(&mut sys, &ReadCache::empty(), &mut backup, id, None).unwrap();
         }
         let plan = plan_revert(&sys, &ReadCache::empty(), Some(&backup), None).unwrap();
         let ids = plan.local;
         assert!(ids.iter().any(|id| id == "p-dvr"));
-        revert_ids(&mut sys, &backup, &ids, None);
+        revert_ids(&mut sys, &mut backup, &ids, None);
         assert_eq!(
             sys.reg_get(Hive::Hkcu, r"System\GameConfigStore", "GameDVR_Enabled").unwrap(),
             Some(RegValue::Dword(1))
@@ -702,7 +752,7 @@ mod tests {
     #[test]
     fn section_optimize_skips_readonly_and_conditional() {
         let sys = ready();
-        let ctx = ReadCache { disk: Some(&sys.disk_report.clone()), disks: None, security: None };
+        let ctx = ReadCache { disk: Some(&sys.disk_report.clone()), disks: None, security: None, power_tier: PowerTier::Ultimate };
         let plan = plan_optimize(&sys, &ctx, Some(Section::Disco)).unwrap();
         assert!(plan.local.is_empty());
         assert!(plan.needs_admin.is_empty());
@@ -714,8 +764,8 @@ mod tests {
     fn unelevated_admin_item_is_not_applied() {
         let mut sys = ready();
         sys.elevated = false;
-        let backup = backup_of(&mut sys);
-        let err = apply_one(&mut sys, &ReadCache::empty(), &backup, "w-diag", None).unwrap_err();
+        let mut backup = backup_of(&mut sys);
+        let err = apply_one(&mut sys, &ReadCache::empty(), &mut backup, "w-diag", None).unwrap_err();
         assert!(matches!(err, EngineError::NeedsAdmin));
         assert!(sys.reg_get(Hive::Hklm, r"SOFTWARE\Policies\Microsoft\Windows\DataCollection", "AllowTelemetry").unwrap().is_none());
     }
@@ -723,11 +773,11 @@ mod tests {
     #[test]
     fn edge_and_ads_revert_delete_values_that_did_not_exist() {
         let mut sys = ready();
-        let backup = backup_of(&mut sys);
-        apply_one(&mut sys, &ReadCache::empty(), &backup, "i-edge", None).unwrap();
-        apply_one(&mut sys, &ReadCache::empty(), &backup, "w-ads", None).unwrap();
-        revert_one(&mut sys, &backup, "i-edge", None).unwrap();
-        revert_one(&mut sys, &backup, "w-ads", None).unwrap();
+        let mut backup = backup_of(&mut sys);
+        apply_one(&mut sys, &ReadCache::empty(), &mut backup, "i-edge", None).unwrap();
+        apply_one(&mut sys, &ReadCache::empty(), &mut backup, "w-ads", None).unwrap();
+        revert_one(&mut sys, &mut backup, "i-edge", None).unwrap();
+        revert_one(&mut sys, &mut backup, "w-ads", None).unwrap();
         assert!(sys.reg_get(Hive::Hklm, r"SOFTWARE\Policies\Microsoft\Edge", "StartupBoostEnabled").unwrap().is_none());
         match sys.reg_get(Hive::Hkcu, r"Software\Microsoft\Windows\CurrentVersion\AdvertisingInfo", "Enabled").unwrap() {
             Some(RegValue::Dword(1)) => {}
@@ -740,10 +790,10 @@ mod tests {
         let mut sys = ready();
         sys.display.monitors[0].hz = 60;
         sys.display.monitors[0].max_hz = 240;
-        let backup = backup_of(&mut sys);
-        apply_one(&mut sys, &ReadCache::empty(), &backup, "g-hz", None).unwrap();
+        let mut backup = backup_of(&mut sys);
+        apply_one(&mut sys, &ReadCache::empty(), &mut backup, "g-hz", None).unwrap();
         assert_eq!(sys.display().unwrap().monitors[0].hz, 240);
-        revert_one(&mut sys, &backup, "g-hz", None).unwrap();
+        revert_one(&mut sys, &mut backup, "g-hz", None).unwrap();
         assert_eq!(sys.display().unwrap().monitors[0].hz, 60);
     }
 
@@ -764,20 +814,222 @@ mod tests {
     #[test]
     fn log_records_apply_and_revert() {
         let mut sys = ready();
-        let backup = backup_of(&mut sys);
+        let mut backup = backup_of(&mut sys);
         let dir = std::env::temp_dir().join(format!("turbo-log-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("log.jsonl");
         let _ = std::fs::remove_file(&path);
-        apply_one(&mut sys, &ReadCache::empty(), &backup, "m-vel", Some(&path)).ok();
+        apply_one(&mut sys, &ReadCache::empty(), &mut backup, "m-vel", Some(&path)).ok();
         // m-vel já está em 10, então não entra no plano. Força um valor diferente.
         sys.mouse_speed = 14;
-        let backup = backup_of(&mut sys);
-        apply_one(&mut sys, &ReadCache::empty(), &backup, "m-vel", Some(&path)).unwrap();
-        revert_one(&mut sys, &backup, "m-vel", Some(&path)).unwrap();
+        let mut backup = backup_of(&mut sys);
+        apply_one(&mut sys, &ReadCache::empty(), &mut backup, "m-vel", Some(&path)).unwrap();
+        revert_one(&mut sys, &mut backup, "m-vel", Some(&path)).unwrap();
         let entries = crate::store::read_log(&path).unwrap();
         assert!(entries.iter().any(|e| e.action == "apply" && e.ok && e.id == "m-vel"));
         assert!(entries.iter().any(|e| e.action == "revert" && e.ok && e.id == "m-vel"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn ultimate_duplicate(guid: &str) -> PowerSchemeInfo {
+        PowerSchemeInfo {
+            guid: guid.into(),
+            name: "Desempenho Máximo".into(),
+            personality: Some(1),
+            disk_timeout_ac: Some(0),
+            min_processor_ac: Some(100),
+        }
+    }
+
+    #[test]
+    fn duplicated_ultimate_is_ok_and_is_not_downgraded() {
+        let mut sys = ready();
+        let guid = "4698c0e9-058a-42c5-b251-951cc5e9db6a";
+        sys.power = guid.into();
+        sys.schemes = vec![ultimate_duplicate(guid)];
+        let view = view_one(&sys, &ReadCache::empty(), None, "p-energia").unwrap();
+        assert_eq!(view.state, ItemState::Ok);
+        assert!(!view.can_optimize);
+        let mut backup = backup_of(&mut sys);
+        let msg = apply_one(&mut sys, &ReadCache::empty(), &mut backup, "p-energia", None).unwrap();
+        assert!(msg.message.contains("Não vou rebaixar") || msg.message.contains("já é"));
+        assert_eq!(normalize_guid(&sys.power_active().unwrap()), guid);
+        assert!(sys.schemes.iter().any(|scheme| normalize_guid(&scheme.guid) == guid));
+    }
+
+    #[test]
+    fn existing_ultimate_duplicate_is_activated_and_not_deleted() {
+        let mut sys = ready();
+        let guid = "4698c0e9-058a-42c5-b251-951cc5e9db6a";
+        sys.power = BALANCED_GUID.into();
+        sys.schemes = vec![ultimate_duplicate(guid)];
+        let mut backup = backup_of(&mut sys);
+        apply_one(&mut sys, &ReadCache::empty(), &mut backup, "p-energia", None).unwrap();
+        assert_eq!(normalize_guid(&sys.power_active().unwrap()), guid);
+        match backup.snapshot("p-energia") {
+            Some(ItemSnapshot::Power { created_guid: None, .. }) => {}
+            other => panic!("plano que já existia não pode ser marcado como criado: {other:?}"),
+        }
+        revert_one(&mut sys, &mut backup, "p-energia", None).unwrap();
+        assert_eq!(normalize_guid(&sys.power_active().unwrap()), BALANCED_GUID);
+        assert!(sys.schemes.iter().any(|scheme| normalize_guid(&scheme.guid) == guid));
+    }
+
+    #[test]
+    fn high_tier_choice_does_not_create_ultimate() {
+        let mut sys = ready();
+        sys.power = BALANCED_GUID.into();
+        let ctx = ReadCache { power_tier: PowerTier::High, ..ReadCache::empty() };
+        let mut backup = backup_of(&mut sys);
+        apply_one(&mut sys, &ctx, &mut backup, "p-energia", None).unwrap();
+        let active = sys.schemes.iter().find(|scheme| normalize_guid(&scheme.guid) == normalize_guid(&sys.power_active().unwrap())).unwrap();
+        assert_eq!(active.disk_timeout_ac, Some(1200));
+        assert_eq!(rules::classify_power(active), rules::PowerClass::High);
+    }
+
+    #[test]
+    fn laptop_balanced_warns_about_the_battery() {
+        let mut sys = ready();
+        sys.machine = MachineKind::Laptop;
+        sys.on_battery = true;
+        sys.power = BALANCED_GUID.into();
+        let view = view_one(&sys, &ReadCache::empty(), None, "p-energia").unwrap();
+        assert_eq!(view.state, ItemState::CanImprove);
+        assert!(view.detail.contains("bateria"));
+    }
+
+    #[test]
+    fn pt_pt_display_does_not_count_and_guid_case_does_not_matter() {
+        let mut sys = ready();
+        sys.adapters[0].interface_guid = "c8e0ba2d-28fa-4db2-91f4-68cc507f35bf".into();
+        sys.adapters[0].power_props[0].current_display = "Activado".into();
+        sys.adapters[0].power_props[0].current = "0".into();
+        sys.adapters[0].power_props[1].current_display = "Desactivado".into();
+        sys.adapters[0].power_props[1].current = "0".into();
+        let view = view_one(&sys, &ReadCache::empty(), None, "n-eee").unwrap();
+        assert_eq!(view.state, ItemState::Ok, "{}", view.detail);
+    }
+
+    #[test]
+    fn intel_nic_keywords_are_turned_off() {
+        let mut sys = ready();
+        sys.adapters = vec![AdapterInfo {
+            name: "Ethernet 2".into(),
+            interface_guid: "{AABBCCDD-1111-2222-3333-444455556666}".into(),
+            description: "Intel(R) Ethernet Controller I226-V".into(),
+            wired: true,
+            connected: true,
+            link_bps: 1_000_000_000,
+            max_bps: 2_500_000_000,
+            power_props: vec![NicPowerProp {
+                display_name: "Energy Efficient Ethernet".into(),
+                keyword: "*EEE".into(),
+                current: "1".into(),
+                current_display: "Enabled".into(),
+                disabled_value: "0".into(),
+                disabled_display: "Disabled".into(),
+            }],
+        }];
+        let mut backup = backup_of(&mut sys);
+        apply_one(&mut sys, &ReadCache::empty(), &mut backup, "n-eee", None).unwrap();
+        assert_eq!(sys.adapters[0].power_props[0].current, "0");
+        assert_eq!(sys.adapter_restarts, 1);
+        revert_one(&mut sys, &mut backup, "n-eee", None).unwrap();
+        assert_eq!(sys.adapters[0].power_props[0].current, "1");
+    }
+
+    #[test]
+    fn wifi_only_and_missing_keywords_do_not_apply() {
+        let mut sys = ready();
+        sys.adapters[0].wired = false;
+        sys.adapters[0].description = "Intel(R) Wi-Fi 6".into();
+        let view = view_one(&sys, &ReadCache::empty(), None, "n-eee").unwrap();
+        assert_eq!(view.state, ItemState::NotApplicable);
+        assert!(!view.can_optimize);
+        let mut backup = backup_of(&mut sys);
+        let before = sys.adapters[0].power_props[0].current.clone();
+        let msg = apply_one(&mut sys, &ReadCache::empty(), &mut backup, "n-eee", None).unwrap();
+        assert!(msg.message.contains("Não se aplica"));
+        assert_eq!(sys.adapters[0].power_props[0].current, before);
+    }
+
+    #[test]
+    fn nic_apply_failure_is_logged_with_the_reason() {
+        let mut sys = ready();
+        sys.fail_nic = Some("não achei a chave da placa Ethernet".into());
+        let mut backup = backup_of(&mut sys);
+        let dir = std::env::temp_dir().join(format!("turbo-nic-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("log.jsonl");
+        let err = apply_one(&mut sys, &ReadCache::empty(), &mut backup, "n-eee", Some(&path)).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("não achei a chave da placa Ethernet"), "{text}");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("não achei a chave da placa Ethernet"), "{raw}");
+        assert!(raw.contains("\"ok\":false"), "{raw}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unelevated_nic_apply_does_not_change_the_adapter() {
+        let mut sys = ready();
+        sys.elevated = false;
+        let mut backup = backup_of(&mut sys);
+        let err = apply_one(&mut sys, &ReadCache::empty(), &mut backup, "n-eee", None).unwrap_err();
+        assert!(matches!(err, EngineError::NeedsAdmin));
+        assert_eq!(sys.adapters[0].power_props[0].current, "1");
+    }
+
+    #[test]
+    fn telemetry_zero_stays_zero_and_three_drops_to_one() {
+        let mut sys = ready();
+        sys.reg_set(Hive::Hklm, r"SOFTWARE\Policies\Microsoft\Windows\DataCollection", "AllowTelemetry", &RegValue::Dword(0)).unwrap();
+        let view = view_one(&sys, &ReadCache::empty(), None, "w-diag").unwrap();
+        assert_eq!(view.state, ItemState::Ok);
+        let mut backup = backup_of(&mut sys);
+        apply_one(&mut sys, &ReadCache::empty(), &mut backup, "w-diag", None).unwrap();
+        assert_eq!(sys.reg_get(Hive::Hklm, r"SOFTWARE\Policies\Microsoft\Windows\DataCollection", "AllowTelemetry").unwrap(), Some(RegValue::Dword(0)));
+
+        sys.reg_set(Hive::Hklm, r"SOFTWARE\Policies\Microsoft\Windows\DataCollection", "AllowTelemetry", &RegValue::Dword(3)).unwrap();
+        let view = view_one(&sys, &ReadCache::empty(), None, "w-diag").unwrap();
+        assert_eq!(view.state, ItemState::CanImprove);
+        let mut backup = backup_of(&mut sys);
+        apply_one(&mut sys, &ReadCache::empty(), &mut backup, "w-diag", None).unwrap();
+        assert_eq!(sys.reg_get(Hive::Hklm, r"SOFTWARE\Policies\Microsoft\Windows\DataCollection", "AllowTelemetry").unwrap(), Some(RegValue::Dword(1)));
+    }
+
+    #[test]
+    fn missing_service_and_empty_startup_are_not_applicable() {
+        let mut sys = ready();
+        sys.services.remove("SysMain");
+        let view = view_one(&sys, &ReadCache::empty(), None, "d-sysmain").unwrap();
+        assert_eq!(view.state, ItemState::NotApplicable);
+        sys.startup.clear();
+        let view = view_one(&sys, &ReadCache::empty(), None, "i-run").unwrap();
+        assert_eq!(view.state, ItemState::NotApplicable);
+        assert!(!view.can_optimize);
+    }
+
+    #[test]
+    fn healthy_disk_without_optional_counters_is_ok() {
+        let mut sys = ready();
+        for disk in &mut sys.disks {
+            disk.read_errors = None;
+            disk.write_errors = None;
+            disk.health = "Healthy".into();
+        }
+        let ctx = ReadCache { disks: Some(&sys.disks.clone()), ..ReadCache::empty() };
+        let view = view_one(&sys, &ctx, None, "d-smart").unwrap();
+        assert_eq!(view.state, ItemState::Ok, "{}", view.detail);
+    }
+
+    #[test]
+    fn sub_gigabit_name_without_a_known_cap_is_not_a_problem() {
+        let mut sys = ready();
+        sys.adapters[0].description = "Ethernet".into();
+        sys.adapters[0].link_bps = 100_000_000;
+        sys.adapters[0].max_bps = 100_000_000;
+        let view = view_one(&sys, &ReadCache::empty(), None, "n-link").unwrap();
+        assert_eq!(view.state, ItemState::Ok, "{}", view.detail);
     }
 }

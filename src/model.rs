@@ -95,6 +95,8 @@ pub enum ItemState {
     CanImprove,
     NotRead,
     NeedsAdmin,
+    /// O hardware ou a chave não existe neste PC. Não é falha nem pendência.
+    NotApplicable,
 }
 
 impl ItemState {
@@ -104,7 +106,12 @@ impl ItemState {
             Self::CanImprove => "PODE MELHORAR",
             Self::NotRead => "NÃO LIDO",
             Self::NeedsAdmin => "PRECISA DE ADMIN",
+            Self::NotApplicable => "NÃO SE APLICA",
         }
+    }
+
+    pub fn settled(self) -> bool {
+        matches!(self, Self::Ok | Self::NotApplicable)
     }
 }
 
@@ -260,9 +267,37 @@ pub struct NicPowerProp {
     pub disabled_display: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MachineKind {
+    Desktop,
+    Laptop,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PowerTier {
+    #[default]
+    Ultimate,
+    High,
+}
+
+/// Um plano como o Windows o entrega: GUID, nome, personalidade e dois
+/// índices numéricos que separam Desempenho Máximo de Alto desempenho.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PowerSchemeInfo {
+    pub guid: String,
+    pub name: String,
+    pub personality: Option<u32>,
+    pub disk_timeout_ac: Option<u32>,
+    pub min_processor_ac: Option<u32>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdapterInfo {
     pub name: String,
+    /// InterfaceGuid / NetCfgInstanceId. A comparação ignora maiúsculas e `{}`.
+    pub interface_guid: String,
+    /// Texto do driver (DriverDesc), não o nome da conexão.
+    pub description: String,
     pub wired: bool,
     pub connected: bool,
     pub link_bps: u64,
@@ -376,6 +411,9 @@ pub enum ItemSnapshot {
     },
     Power {
         guid: String,
+        /// Plano que o Turbo criou com duplicatescheme. Reverter apaga só este.
+        #[serde(default)]
+        created_guid: Option<String>,
     },
     MouseAccel {
         threshold1: i32,
@@ -409,6 +447,8 @@ pub enum ItemSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NicSnap {
     pub adapter: String,
+    #[serde(default)]
+    pub interface_guid: String,
     pub keyword: String,
     pub value: String,
 }
@@ -459,6 +499,8 @@ pub struct ItemView {
 pub enum BackendError {
     #[error("acesso negado: {0}")]
     AccessDenied(String),
+    #[error("não encontrado: {0}")]
+    NotFound(String),
     #[error("{0}")]
     Failed(String),
 }
@@ -485,6 +527,7 @@ impl From<BackendError> for EngineError {
             BackendError::AccessDenied(msg) => {
                 EngineError::Message(format!("Acesso negado. {msg}"))
             }
+            BackendError::NotFound(msg) => EngineError::Message(msg),
             BackendError::Failed(msg) => EngineError::Backend(msg),
         }
     }

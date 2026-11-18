@@ -17,7 +17,7 @@ use crate::model::*;
 
 use windows::core::{w, GUID, HSTRING, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, LocalFree, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_PRIVILEGE_NOT_HELD, HANDLE, HLOCAL, LUID, WIN32_ERROR,
+    CloseHandle, LocalFree, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_PRIVILEGE_NOT_HELD, HANDLE, HLOCAL, LUID, WIN32_ERROR,
 };
 use windows::Win32::Graphics::Gdi::{
     ChangeDisplaySettingsExW, EnumDisplayDevicesW, EnumDisplaySettingsW, CDS_UPDATEREGISTRY, DEVMODEW, DEVMODE_FIELD_FLAGS, DISPLAY_DEVICEW, DISP_CHANGE_SUCCESSFUL, DM_DISPLAYFREQUENCY, ENUM_CURRENT_SETTINGS, ENUM_DISPLAY_SETTINGS_MODE,
@@ -31,7 +31,11 @@ use windows::Win32::System::EventLog::{EvtClose, EvtNext, EvtQuery, EvtRender, E
 use windows::Win32::System::Performance::{
     PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData, PdhGetFormattedCounterArrayW, PdhOpenQueryW, PDH_FMT_COUNTERVALUE_ITEM_W, PDH_FMT_DOUBLE,
 };
-use windows::Win32::System::Power::{PowerGetActiveScheme, PowerSetActiveScheme};
+use windows::Win32::System::Power::{
+    GetSystemPowerStatus, PowerDeleteScheme, PowerDuplicateScheme, PowerEnumerate, PowerGetActiveScheme, PowerReadACValueIndex, PowerReadFriendlyName, PowerSetActiveScheme, ACCESS_SCHEME, SYSTEM_POWER_STATUS,
+};
+use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+use windows::Win32::System::Wmi::{IWbemContext, WBEM_GENERIC_FLAG_TYPE};
 use windows::Win32::System::Registry::{
     RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegEnumValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_SET_VALUE, REG_BINARY, REG_DWORD, REG_EXPAND_SZ, REG_MULTI_SZ, REG_SZ, REG_VALUE_TYPE,
 };
@@ -60,6 +64,7 @@ pub fn mark_ui_thread() {
 
 pub struct WindowsBackend {
     _com: COMLibrary,
+    created_power: Option<String>,
 }
 
 /// Solta o `COMLibrary` e só então chama `CoUninitialize`.
@@ -81,7 +86,7 @@ impl WindowsBackend {
             return Err("COM multithread não pode ser inicializado na thread da janela".into());
         }
         let com = COMLibrary::new().map_err(|e| e.to_string())?;
-        Ok(Self { _com: com })
+        Ok(Self { _com: com, created_power: None })
     }
 
     /// Cria o backend, executa `f` e desfaz o COM nesta thread.
@@ -231,6 +236,63 @@ impl SystemBackend for WindowsBackend {
         }
     }
 
+    fn power_schemes(&self) -> Result<Vec<PowerSchemeInfo>, BackendError> {
+        read_power_schemes()
+    }
+
+    fn power_duplicate(&mut self, source_guid: &str) -> Result<String, BackendError> {
+        let source = parse_guid(source_guid)?;
+        unsafe {
+            let mut dest = std::ptr::null_mut();
+            let err = PowerDuplicateScheme(HKEY::default(), &source, &mut dest);
+            win_ok(err, "duplicar plano de energia")?;
+            if dest.is_null() {
+                return Err(BackendError::Failed("o Windows não devolveu o GUID do plano criado".into()));
+            }
+            let guid = guid_to_string(&*dest);
+            let _ = LocalFree(HLOCAL(dest as *mut _));
+            crate::store::trace(&format!("energia duplicatescheme {source_guid} -> {guid}"));
+            Ok(guid)
+        }
+    }
+
+    fn power_delete(&mut self, guid: &str) -> Result<(), BackendError> {
+        if crate::rules::is_builtin_scheme(guid) {
+            return Err(BackendError::Failed("não apago um plano embutido do Windows".into()));
+        }
+        let parsed = parse_guid(guid)?;
+        unsafe {
+            let err = PowerDeleteScheme(HKEY::default(), &parsed);
+            if err == ERROR_FILE_NOT_FOUND || err.0 == 2 {
+                crate::store::trace(&format!("energia apagar {guid}: já não existia"));
+                return Ok(());
+            }
+            win_ok(err, "apagar plano de energia")?;
+        }
+        crate::store::trace(&format!("energia apaguei {guid}"));
+        Ok(())
+    }
+
+    fn note_created_power_scheme(&mut self, guid: &str) {
+        self.created_power = Some(normalize_guid(guid));
+    }
+
+    fn take_created_power_scheme(&mut self) -> Option<String> {
+        self.created_power.take()
+    }
+
+    fn machine_kind(&self) -> MachineKind {
+        match power_status() {
+            Some(status) if status.BatteryFlag == 128 || status.BatteryFlag == 255 => MachineKind::Desktop,
+            Some(_) => MachineKind::Laptop,
+            None => MachineKind::Desktop,
+        }
+    }
+
+    fn on_battery(&self) -> bool {
+        power_status().is_some_and(|status| status.ACLineStatus == 0)
+    }
+
     fn mouse_accel(&self) -> Result<MouseAccel, BackendError> {
         let mut arr = [0i32; 3];
         spi_get(SPI_GETMOUSE, 0, arr.as_mut_ptr() as *mut _)?;
@@ -329,8 +391,12 @@ impl SystemBackend for WindowsBackend {
         read_adapters(self)
     }
 
-    fn set_adapter_keyword(&mut self, adapter: &str, keyword: &str, value: &str) -> Result<(), BackendError> {
-        set_nic_keyword(self, adapter, keyword, value)
+    fn set_adapter_keyword(&mut self, adapter: &str, interface_guid: &str, keyword: &str, value: &str) -> Result<(), BackendError> {
+        set_nic_keyword(self, adapter, interface_guid, keyword, value)
+    }
+
+    fn restart_adapter(&mut self, adapter: &str, interface_guid: &str) -> Result<(), BackendError> {
+        bounce_adapter(self, adapter, interface_guid)
     }
 
     fn physical_printers(&self) -> Result<Vec<String>, BackendError> {
@@ -553,7 +619,10 @@ fn open_service(name: &str, access: u32) -> Result<SvcHandle, BackendError> {
         let scm = SvcHandle(scm);
         let svc = OpenServiceW(scm.0, PCWSTR(name_w.as_ptr()), access).map_err(|e| {
             let msg = e.to_string();
-            if msg.to_ascii_lowercase().contains("access") {
+            let code = e.code().0 as u32;
+            if code == 0x8007_0424 || (code & 0xFFFF) == 1060 {
+                BackendError::NotFound(format!("serviço {name} não existe"))
+            } else if msg.to_ascii_lowercase().contains("access") {
                 BackendError::AccessDenied(format!("serviço {name}: {msg}"))
             } else {
                 BackendError::Failed(format!("abrir serviço {name}: {msg}"))
@@ -577,6 +646,123 @@ fn spi_get(action: windows::Win32::UI::WindowsAndMessaging::SYSTEM_PARAMETERS_IN
 fn spi_set(action: windows::Win32::UI::WindowsAndMessaging::SYSTEM_PARAMETERS_INFO_ACTION, param: u32, ptr: *mut core::ffi::c_void) -> Result<(), BackendError> {
     let flags = SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(SPIF_UPDATEINIFILE.0 | SPIF_SENDCHANGE.0);
     unsafe { SystemParametersInfoW(action, param, Some(ptr), flags).map_err(|e| BackendError::Failed(e.to_string())) }
+}
+
+const POWER_SUB_PERSONALITY: &str = "fea3413e-7e05-4911-9a71-700331f1c294";
+const POWER_PERSONALITY: &str = "245d8541-3943-4422-b025-13a784f679b7";
+const POWER_SUB_DISK: &str = "0012ee47-9041-4b5d-9b77-535fba8b1442";
+const POWER_DISK_TIMEOUT: &str = "6738e2c4-e8a5-4a42-b16a-e040e769756e";
+const POWER_SUB_PROCESSOR: &str = "54533251-82be-4824-96c1-47b60b740d00";
+const POWER_MIN_PROCESSOR: &str = "893dee8e-2bef-41e0-89c6-b55d0929964c";
+
+fn power_status() -> Option<SYSTEM_POWER_STATUS> {
+    let mut status = SYSTEM_POWER_STATUS::default();
+    unsafe { GetSystemPowerStatus(&mut status).ok()? };
+    Some(status)
+}
+
+fn read_power_schemes() -> Result<Vec<PowerSchemeInfo>, BackendError> {
+    let mut out = Vec::new();
+    let mut index = 0u32;
+    loop {
+        let mut buf = [0u8; std::mem::size_of::<GUID>()];
+        let mut size = buf.len() as u32;
+        let err = unsafe { PowerEnumerate(HKEY::default(), None, None, ACCESS_SCHEME, index, Some(buf.as_mut_ptr()), &mut size) };
+        if err.0 == 259 {
+            break;
+        }
+        win_ok(err, "enumerar planos de energia")?;
+        let guid = unsafe { *(buf.as_ptr() as *const GUID) };
+        let text = guid_to_string(&guid);
+        out.push(PowerSchemeInfo {
+            name: power_friendly_name(&guid),
+            personality: power_ac_index(&guid, POWER_SUB_PERSONALITY, POWER_PERSONALITY),
+            disk_timeout_ac: power_ac_index(&guid, POWER_SUB_DISK, POWER_DISK_TIMEOUT),
+            min_processor_ac: power_ac_index(&guid, POWER_SUB_PROCESSOR, POWER_MIN_PROCESSOR),
+            guid: text,
+        });
+        index += 1;
+        if index > 64 {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+fn power_friendly_name(guid: &GUID) -> String {
+    let mut size = 0u32;
+    let probe = unsafe { PowerReadFriendlyName(HKEY::default(), Some(guid), None, None, None, &mut size) };
+    if probe.0 != 0 && probe != ERROR_MORE_DATA || size < 4 {
+        return String::new();
+    }
+    let mut buf = vec![0u8; size as usize];
+    let err = unsafe { PowerReadFriendlyName(HKEY::default(), Some(guid), None, None, Some(buf.as_mut_ptr()), &mut size) };
+    if err.0 != 0 {
+        return String::new();
+    }
+    let words = size as usize / 2;
+    let units = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u16, words.min(buf.len() / 2)) };
+    utf16_fixed(units).trim().to_string()
+}
+
+fn power_ac_index(scheme: &GUID, subgroup: &str, setting: &str) -> Option<u32> {
+    let subgroup = parse_guid(subgroup).ok()?;
+    let setting = parse_guid(setting).ok()?;
+    let mut value = 0u32;
+    let err = unsafe { PowerReadACValueIndex(HKEY::default(), Some(scheme), Some(&subgroup), Some(&setting), &mut value) };
+    if err.0 == 0 { Some(value) } else { None }
+}
+
+/// CPU, GPU, RAM e monitor só para o painel. Não entra em nenhum ajuste.
+pub fn hardware_summary() -> (String, String, String, String) {
+    let cpu = reg_sz(Hive::Hklm, r"HARDWARE\DESCRIPTION\System\CentralProcessor\0", "ProcessorNameString")
+        .unwrap_or_else(|| "CPU não identificada".into());
+    let gpu = gpu_name().unwrap_or_else(|| "GPU não identificada".into());
+    let ram = ram_label().unwrap_or_else(|| "RAM não identificada".into());
+    let monitor = monitor_label().unwrap_or_else(|| "Monitor não identificado".into());
+    (cpu, gpu, ram, monitor)
+}
+
+fn reg_sz(hive: Hive, path: &str, name: &str) -> Option<String> {
+    let key = open_key(hive, path, KEY_READ.0).ok()??;
+    query_value(key.0, name).ok().flatten().and_then(|value| match value {
+        RegValue::Sz(text) => Some(text.trim().to_string()),
+        _ => None,
+    })
+}
+
+fn gpu_name() -> Option<String> {
+    let class = r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}";
+    let root = open_key(Hive::Hklm, class, KEY_READ.0).ok()??;
+    let mut names = Vec::new();
+    for sub in enum_subkeys(root.0) {
+        if !sub.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let path = format!(r"{class}\{sub}");
+        if let Some(desc) = reg_sz(Hive::Hklm, &path, "DriverDesc") {
+            let lower = desc.to_ascii_lowercase();
+            if lower.contains("microsoft basic") || lower.contains("remote") {
+                continue;
+            }
+            names.push(desc);
+        }
+    }
+    names.into_iter().next()
+}
+
+fn ram_label() -> Option<String> {
+    let mut status = MEMORYSTATUSEX { dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32, ..Default::default() };
+    unsafe { GlobalMemoryStatusEx(&mut status).ok()? };
+    let gb = status.ullTotalPhys as f64 / 1024.0 / 1024.0 / 1024.0;
+    Some(format!("{gb:.0} GB"))
+}
+
+fn monitor_label() -> Option<String> {
+    let monitors = read_monitors().ok()?;
+    let first = monitors.first()?;
+    let name = if first.device.is_empty() { "Monitor".to_string() } else { first.device.clone() };
+    Some(format!("{name} · {} Hz", first.hz))
 }
 
 fn guid_to_string(guid: &GUID) -> String {
@@ -1012,12 +1198,12 @@ fn disk_index(text: &str) -> Option<u32> {
 }
 
 fn read_adapters(backend: &WindowsBackend) -> Result<Vec<AdapterInfo>, BackendError> {
-    // MSFT_NetAdapter não tem LinkSpeed. Essa propriedade é do PowerShell.
-    // No CIM existem Speed, ReceiveLinkSpeed e TransmitLinkSpeed.
+    // MSFT_NetAdapter não tem LinkSpeed. No CIM existem Speed, ReceiveLinkSpeed e TransmitLinkSpeed.
     #[derive(Deserialize)]
     struct Row {
         Name: Option<String>,
         InterfaceDescription: Option<String>,
+        InterfaceGuid: Option<String>,
         NdisPhysicalMedium: Option<u32>,
         HardwareInterface: Option<bool>,
         MediaConnectState: Option<u32>,
@@ -1025,12 +1211,15 @@ fn read_adapters(backend: &WindowsBackend) -> Result<Vec<AdapterInfo>, BackendEr
         ReceiveLinkSpeed: Option<u64>,
         TransmitLinkSpeed: Option<u64>,
     }
-    let rows: Vec<Row> = wmi_query(
-        backend,
-        r"root\StandardCimv2",
-        "placas de rede",
-        "SELECT Name, InterfaceDescription, NdisPhysicalMedium, HardwareInterface, MediaConnectState, Speed, ReceiveLinkSpeed, TransmitLinkSpeed FROM MSFT_NetAdapter",
-    )?;
+    let with_guid = "SELECT Name, InterfaceDescription, InterfaceGuid, NdisPhysicalMedium, HardwareInterface, MediaConnectState, Speed, ReceiveLinkSpeed, TransmitLinkSpeed FROM MSFT_NetAdapter";
+    let rows: Vec<Row> = match wmi_query(backend, r"root\StandardCimv2", "placas de rede", with_guid) {
+        Ok(rows) => rows,
+        Err(err) => {
+            crate::store::trace(&format!("n-link consulta com InterfaceGuid falhou ({err}); tentando sem o campo"));
+            let fallback = "SELECT Name, InterfaceDescription, NdisPhysicalMedium, HardwareInterface, MediaConnectState, Speed, ReceiveLinkSpeed, TransmitLinkSpeed FROM MSFT_NetAdapter";
+            wmi_query(backend, r"root\StandardCimv2", "placas de rede", fallback)?
+        }
+    };
     let mut out = Vec::new();
     for row in rows {
         if row.HardwareInterface == Some(false) {
@@ -1040,174 +1229,309 @@ fn read_adapters(backend: &WindowsBackend) -> Result<Vec<AdapterInfo>, BackendEr
         if name.is_empty() {
             continue;
         }
+        let description = row.InterfaceDescription.clone().unwrap_or_default();
         let medium = row.NdisPhysicalMedium.unwrap_or(0);
-        let desc = row.InterfaceDescription.unwrap_or_default().to_ascii_lowercase();
-        let wired = medium == 14 || (!desc.contains("wi-fi") && !desc.contains("wireless") && !desc.contains("wlan") && medium != 9);
+        let wired = nic_is_wired(medium, &description);
         let connected = row.MediaConnectState == Some(1);
-        let props = nic_props(backend, &name);
+        let guid = row.InterfaceGuid.clone().unwrap_or_default();
+        let props = nic_props(backend, &name, &guid);
         let link = row.ReceiveLinkSpeed.unwrap_or(0).max(row.TransmitLinkSpeed.unwrap_or(0)).max(row.Speed.unwrap_or(0));
-        let max_bps = link.max(guess_max(link, wired));
-        out.push(AdapterInfo { name, wired, connected, link_bps: link, max_bps, power_props: props });
+        let max_bps = crate::rules::inferred_link_cap_bps(&description).unwrap_or(link);
+        out.push(AdapterInfo {
+            name,
+            interface_guid: guid,
+            description,
+            wired,
+            connected,
+            link_bps: link,
+            max_bps,
+            power_props: props,
+        });
     }
     Ok(out)
 }
 
-fn guess_max(link: u64, wired: bool) -> u64 {
-    if !wired {
-        return link;
+fn nic_is_wired(medium: u32, description: &str) -> bool {
+    // 14 = 802.3, 9 = 802.11, 10 = Bluetooth. O nome da conexão não entra.
+    match medium {
+        14 => true,
+        9 | 10 => false,
+        _ => {
+            let text = description.to_ascii_lowercase();
+            let wireless = text.contains("wi-fi") || text.contains("wifi") || text.contains("wireless") || text.contains("wlan") || text.contains("802.11") || text.contains("bluetooth");
+            !wireless && (text.contains("ethernet") || text.contains("gbe") || text.contains("i225") || text.contains("i226"))
+        }
     }
-    if link > 0 && link < 1_000_000_000 { 1_000_000_000 } else { link }
 }
 
-fn nic_props(backend: &WindowsBackend, adapter: &str) -> Vec<NicPowerProp> {
+fn nic_props(backend: &WindowsBackend, adapter: &str, interface_guid: &str) -> Vec<NicPowerProp> {
     let safe: String = adapter.chars().filter(|c| *c != '\'' && *c != ';' && *c != '"').collect();
-    if safe.is_empty() {
-        return registry_nic_props(backend, adapter);
+    let from_cim = if safe.is_empty() { Vec::new() } else { cim_nic_props(backend, &safe) };
+    if !from_cim.is_empty() {
+        return from_cim;
     }
+    registry_nic_props(backend, interface_guid, adapter)
+}
+
+fn cim_nic_props(backend: &WindowsBackend, adapter: &str) -> Vec<NicPowerProp> {
     #[derive(Deserialize, Default)]
     struct Prop {
-        Name: Option<String>,
         DisplayName: Option<String>,
         RegistryKeyword: Option<String>,
         DisplayValue: Option<String>,
         RegistryValue: Option<Vec<String>>,
-        ValidDisplayValues: Option<Vec<String>>,
-        ValidRegistryValues: Option<Vec<String>>,
     }
-    let query = format!("SELECT Name, DisplayName, RegistryKeyword, DisplayValue, RegistryValue, ValidDisplayValues, ValidRegistryValues FROM MSFT_NetAdapterAdvancedPropertySettingData WHERE Name = '{safe}'");
+    let query = format!("SELECT Name, DisplayName, RegistryKeyword, DisplayValue, RegistryValue FROM MSFT_NetAdapterAdvancedPropertySettingData WHERE Name = '{adapter}'");
     let rows: Vec<Prop> = match wmi_query(backend, r"root\StandardCimv2", "propriedades da placa", &query) {
         Ok(rows) => rows,
-        Err(_) => return registry_nic_props(backend, adapter),
+        Err(err) => {
+            crate::store::trace(&format!("n-eee CIM leitura de {adapter} falhou: {err}"));
+            return Vec::new();
+        }
     };
     rows.into_iter().filter_map(|row| {
-        let display = row.DisplayName.unwrap_or_default();
-        if !is_power_prop(&display) {
+        let keyword = row.RegistryKeyword.unwrap_or_default();
+        if !crate::rules::is_nic_power_keyword(&keyword) {
             return None;
         }
         let current = row.RegistryValue.and_then(|v| v.into_iter().next()).unwrap_or_default();
-        let (disabled_value, disabled_display) = disabled_pair(row.ValidDisplayValues.as_deref(), row.ValidRegistryValues.as_deref());
         Some(NicPowerProp {
-            display_name: display,
-            keyword: row.RegistryKeyword.unwrap_or_default(),
+            display_name: row.DisplayName.unwrap_or_else(|| keyword.clone()),
+            keyword,
             current,
             current_display: row.DisplayValue.unwrap_or_default(),
-            disabled_value,
-            disabled_display,
+            disabled_value: "0".into(),
+            disabled_display: "0".into(),
         })
     }).collect()
 }
 
-fn is_power_prop(name: &str) -> bool {
-    const NAMES: &[&str] = &["energia eficiente ethernet", "energy-efficient ethernet", "energy efficient ethernet", "power saving mode", "green ethernet"];
-    NAMES.iter().any(|n| name.eq_ignore_ascii_case(n))
-}
-
-fn disabled_pair(displays: Option<&[String]>, values: Option<&[String]>) -> (String, String) {
-    let displays = displays.unwrap_or(&[]);
-    let values = values.unwrap_or(&[]);
-    for (display, value) in displays.iter().zip(values.iter()) {
-        let d = display.to_ascii_lowercase();
-        if d.contains("desativ") || d.contains("disabled") || d == "off" {
-            return (value.clone(), display.clone());
-        }
-    }
-    ("0".into(), "Desativado".into())
-}
-
-fn registry_nic_props(backend: &WindowsBackend, adapter: &str) -> Vec<NicPowerProp> {
-    let Some(sub) = find_nic_subkey(backend, adapter) else { return Vec::new(); };
+fn registry_nic_props(backend: &WindowsBackend, interface_guid: &str, adapter: &str) -> Vec<NicPowerProp> {
+    let Some(sub) = find_nic_subkey(backend, interface_guid, adapter) else { return Vec::new(); };
     let path = format!(r"{NET_CLASS}\{sub}");
     let Ok(values) = backend.reg_list(Hive::Hklm, &path) else { return Vec::new(); };
     let mut out = Vec::new();
     for (name, value) in values {
-        let display = keyword_display(&name);
-        if display.is_none() {
+        if !crate::rules::is_nic_power_keyword(&name) {
             continue;
         }
         let current = match value {
-            RegValue::Sz(s) => s,
+            RegValue::Sz(text) => text,
             RegValue::Dword(n) => n.to_string(),
             _ => continue,
         };
-        let off = current == "0";
         out.push(NicPowerProp {
-            display_name: display.unwrap(),
+            display_name: name.clone(),
             keyword: name,
-            current_display: if off { "Desativado".into() } else { "Ativado".into() },
+            current_display: current.clone(),
             disabled_value: "0".into(),
-            disabled_display: "Desativado".into(),
+            disabled_display: "0".into(),
             current,
         });
     }
     out
 }
 
-fn keyword_display(keyword: &str) -> Option<String> {
-    let k = keyword.to_ascii_lowercase();
-    if k.contains("eee") {
-        Some("Energy-Efficient Ethernet".into())
-    } else if k.contains("powersaving") {
-        Some("Power Saving Mode".into())
-    } else if k.contains("greenethernet") || k.contains("green ethernet") {
-        Some("Green Ethernet".into())
-    } else {
-        None
+fn find_nic_subkey(backend: &WindowsBackend, interface_guid: &str, connection_name: &str) -> Option<String> {
+    let root = open_key(Hive::Hklm, NET_CLASS, KEY_READ.0).ok()??;
+    let subs = enum_subkeys(root.0);
+    let mut seen = Vec::new();
+    for sub in &subs {
+        let path = format!(r"{NET_CLASS}\{sub}");
+        let netcfg = match backend.reg_get(Hive::Hklm, &path, "NetCfgInstanceId").ok().flatten() {
+            Some(RegValue::Sz(text)) => text,
+            _ => String::new(),
+        };
+        seen.push(format!("{sub}={netcfg}"));
+        if !interface_guid.is_empty() && crate::rules::guids_equal(&netcfg, interface_guid) {
+            return Some(sub.clone());
+        }
     }
+    if let Some(guid) = connection_guid(backend, connection_name) {
+        for sub in &subs {
+            let path = format!(r"{NET_CLASS}\{sub}");
+            if let Some(RegValue::Sz(text)) = backend.reg_get(Hive::Hklm, &path, "NetCfgInstanceId").ok().flatten() {
+                if crate::rules::guids_equal(&text, &guid) {
+                    return Some(sub.clone());
+                }
+            }
+        }
+    }
+    crate::store::trace(&format!(
+        "n-eee não achei NetCfgInstanceId {interface_guid} (conexão {connection_name}). subchaves: {}",
+        seen.join(", ")
+    ));
+    None
 }
 
-fn find_nic_subkey(backend: &WindowsBackend, adapter: &str) -> Option<String> {
-    let root = open_key(Hive::Hklm, NET_CLASS, KEY_READ.0).ok()??;
-    for index in 0..64 {
-        let mut name = [0u16; 32];
-        let mut len = name.len() as u32;
-        let err = unsafe { windows::Win32::System::Registry::RegEnumKeyExW(root.0, index, PWSTR(name.as_mut_ptr()), &mut len, None, PWSTR::null(), None, None) };
-        if err.0 != 0 {
-            break;
-        }
-        let sub = String::from_utf16_lossy(&name[..len as usize]);
-        let path = format!(r"{NET_CLASS}\{sub}");
-        let driver = backend.reg_get(Hive::Hklm, &path, "DriverDesc").ok().flatten();
-        let netcfg = backend.reg_get(Hive::Hklm, &path, "NetCfgInstanceId").ok().flatten();
-        let matches = match (&driver, &netcfg) {
-            (Some(RegValue::Sz(text)), _) if text.eq_ignore_ascii_case(adapter) => true,
-            (_, Some(RegValue::Sz(text))) if text.eq_ignore_ascii_case(adapter) => true,
-            (Some(RegValue::Sz(text)), _) if text.to_ascii_lowercase().contains(&adapter.to_ascii_lowercase()) => true,
-            _ => false,
-        };
-        if matches {
-            return Some(sub);
+fn connection_guid(backend: &WindowsBackend, connection_name: &str) -> Option<String> {
+    if connection_name.is_empty() {
+        return None;
+    }
+    let root_path = format!(r"SYSTEM\CurrentControlSet\Control\Network\{{4d36e972-e325-11ce-bfc1-08002be10318}}");
+    let root = open_key(Hive::Hklm, &root_path, KEY_READ.0).ok()??;
+    for sub in enum_subkeys(root.0) {
+        let path = format!(r"{root_path}\{sub}\Connection");
+        if let Some(RegValue::Sz(name)) = backend.reg_get(Hive::Hklm, &path, "Name").ok().flatten() {
+            if name.eq_ignore_ascii_case(connection_name) {
+                return Some(sub);
+            }
         }
     }
     None
 }
 
-fn set_nic_keyword(backend: &mut WindowsBackend, adapter: &str, keyword: &str, value: &str) -> Result<(), BackendError> {
-    let sub = find_nic_subkey(backend, adapter).ok_or_else(|| BackendError::Failed(format!("não achei a chave da placa {adapter}")))?;
+fn enum_subkeys(key: HKEY) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut index = 0u32;
+    while index < 512 {
+        let mut name = vec![0u16; 256];
+        let mut len = name.len() as u32;
+        let err = unsafe {
+            windows::Win32::System::Registry::RegEnumKeyExW(key, index, PWSTR(name.as_mut_ptr()), &mut len, None, PWSTR::null(), None, None)
+        };
+        if err.0 == 259 {
+            break;
+        }
+        if err == ERROR_MORE_DATA {
+            name.resize(1024, 0);
+            len = name.len() as u32;
+            let err = unsafe {
+                windows::Win32::System::Registry::RegEnumKeyExW(key, index, PWSTR(name.as_mut_ptr()), &mut len, None, PWSTR::null(), None, None)
+            };
+            if err.0 != 0 {
+                crate::store::trace(&format!("enumerar subchave {index} falhou (código {})", err.0));
+                index += 1;
+                continue;
+            }
+            out.push(String::from_utf16_lossy(&name[..len as usize]));
+            index += 1;
+            continue;
+        }
+        if err.0 != 0 {
+            crate::store::trace(&format!("enumerar subchave parou no índice {index} (código {})", err.0));
+            break;
+        }
+        out.push(String::from_utf16_lossy(&name[..len as usize]));
+        index += 1;
+    }
+    out
+}
+
+fn set_nic_keyword(backend: &mut WindowsBackend, adapter: &str, interface_guid: &str, keyword: &str, value: &str) -> Result<(), BackendError> {
+    match put_cim_keyword(backend, adapter, keyword, value) {
+        Ok(()) => {
+            crate::store::trace(&format!("n-eee CIM gravou {adapter} {keyword}={value}"));
+            return Ok(());
+        }
+        Err(err) => crate::store::trace(&format!("n-eee CIM não gravou {adapter} {keyword}={value}: {err}. caindo para o registro")),
+    }
+    let sub = find_nic_subkey(backend, interface_guid, adapter).ok_or_else(|| {
+        BackendError::Failed(format!("não achei a chave da placa {adapter} (guid {interface_guid})"))
+    })?;
     let path = format!(r"{NET_CLASS}\{sub}");
     let existing = backend.reg_get(Hive::Hklm, &path, keyword)?;
     let written = match existing {
         Some(RegValue::Dword(_)) => RegValue::Dword(value.parse().unwrap_or(0)),
-        _ => RegValue::Sz(value.to_string()),
+        Some(_) => RegValue::Sz(value.to_string()),
+        None => return Err(BackendError::NotFound(format!("a placa {adapter} não tem {keyword}"))),
     };
-    backend.reg_set(Hive::Hklm, &path, keyword, &written)?;
-    bounce_adapter(backend, adapter);
+    crate::store::trace(&format!("n-eee registro {path} {keyword}={value}"));
+    backend.reg_set(Hive::Hklm, &path, keyword, &written)
+}
+
+fn put_cim_keyword(backend: &WindowsBackend, adapter: &str, keyword: &str, value: &str) -> Result<(), BackendError> {
+    #[derive(Deserialize)]
+    struct Prop {
+        Name: Option<String>,
+        RegistryKeyword: Option<String>,
+        __Path: Option<String>,
+    }
+    let rows: Vec<Prop> = wmi_query(
+        backend,
+        r"root\StandardCimv2",
+        "caminho da propriedade",
+        "SELECT Name, RegistryKeyword, __Path FROM MSFT_NetAdapterAdvancedPropertySettingData",
+    )?;
+    let path = rows
+        .into_iter()
+        .find(|row| row.Name.as_deref().unwrap_or("").eq_ignore_ascii_case(adapter) && row.RegistryKeyword.as_deref().unwrap_or("").eq_ignore_ascii_case(keyword))
+        .and_then(|row| row.__Path)
+        .ok_or_else(|| BackendError::NotFound(format!("CIM sem {keyword} em {adapter}")))?;
+    let wmi = backend.wmi(r"root\StandardCimv2")?;
+    let variant = string_array_variant(value);
+    unsafe {
+        let mut object = None;
+        wmi.svc
+            .GetObject(&windows_core::BSTR::from(path.as_str()), WBEM_GENERIC_FLAG_TYPE(0), None::<&IWbemContext>, Some(&mut object), None)
+            .map_err(|err| BackendError::Failed(format!("GetObject {path}: {err}")))?;
+        let object = object.ok_or_else(|| BackendError::Failed(format!("GetObject {path} veio vazio")))?;
+        object
+            .Put(windows::core::w!("RegistryValue"), 0, &variant, 0)
+            .map_err(|err| BackendError::Failed(format!("Put RegistryValue: {err}")))?;
+        wmi.svc
+            .PutInstance(&object, WBEM_GENERIC_FLAG_TYPE(1), None::<&IWbemContext>, None)
+            .map_err(|err| BackendError::Failed(format!("PutInstance: {err}")))?;
+    }
     Ok(())
 }
 
-fn bounce_adapter(backend: &WindowsBackend, adapter: &str) {
+fn string_array_variant(value: &str) -> windows_core::VARIANT {
+    unsafe {
+        let array = windows::Win32::System::Ole::SafeArrayCreateVector(windows::Win32::System::Variant::VT_BSTR, 0, 1);
+        if array.is_null() {
+            return windows_core::VARIANT::from(value);
+        }
+        let bstr = windows_core::BSTR::from(value);
+        let index = 0i32;
+        let _ = windows::Win32::System::Ole::SafeArrayPutElement(array, &index, bstr.as_ptr() as *const _);
+        windows_core::VARIANT::from_raw(windows_core::imp::VARIANT {
+            Anonymous: windows_core::imp::VARIANT_0 {
+                Anonymous: windows_core::imp::VARIANT_0_0 {
+                    vt: 8 | 8192,
+                    wReserved1: 0,
+                    wReserved2: 0,
+                    wReserved3: 0,
+                    Anonymous: windows_core::imp::VARIANT_0_0_0 { parray: array as *mut windows_core::imp::SAFEARRAY },
+                },
+            },
+        })
+    }
+}
+
+fn bounce_adapter(backend: &WindowsBackend, adapter: &str, interface_guid: &str) -> Result<(), BackendError> {
     #[derive(Deserialize)]
-    struct AdapterRow { __Path: Option<String>, Name: Option<String> }
+    struct AdapterRow {
+        __Path: Option<String>,
+        Name: Option<String>,
+        InterfaceGuid: Option<String>,
+    }
     #[derive(Deserialize)]
-    struct Ret { ReturnValue: Option<u32> }
-#[derive(Deserialize)]
-#[allow(non_camel_case_types)]
-struct MSFT_NetAdapter {}
-    let Ok(rows) = wmi_query::<AdapterRow>(backend, r"root\StandardCimv2", "religar placa", "SELECT Name, __Path FROM MSFT_NetAdapter") else { return };
-    let Some(path) = rows.into_iter().find(|r| r.Name.as_deref().unwrap_or("").eq_ignore_ascii_case(adapter)).and_then(|r| r.__Path) else { return };
-    let Ok(wmi) = backend.wmi(r"root\StandardCimv2") else { return };
-    let _ = wmi.exec_instance_method::<MSFT_NetAdapter, _, Ret>("Disable", &path, ());
+    struct Ret {
+        ReturnValue: Option<u32>,
+    }
+    #[derive(Deserialize)]
+    #[allow(non_camel_case_types)]
+    struct MSFT_NetAdapter {}
+    let rows = match wmi_query::<AdapterRow>(backend, r"root\StandardCimv2", "religar placa", "SELECT Name, InterfaceGuid, __Path FROM MSFT_NetAdapter") {
+        Ok(rows) => rows,
+        Err(err) => {
+            crate::store::trace(&format!("n-eee reiniciar {adapter} sem consulta: {err}"));
+            return Err(err);
+        }
+    };
+    let path = rows
+        .iter()
+        .find(|row| crate::rules::guids_equal(row.InterfaceGuid.as_deref().unwrap_or(""), interface_guid))
+        .or_else(|| rows.iter().find(|row| row.Name.as_deref().unwrap_or("").eq_ignore_ascii_case(adapter)))
+        .and_then(|row| row.__Path.clone())
+        .ok_or_else(|| BackendError::Failed(format!("não achei {adapter} para reiniciar")))?;
+    let wmi = backend.wmi(r"root\StandardCimv2")?;
+    wmi.exec_instance_method::<MSFT_NetAdapter, _, Ret>("Disable", &path, ()).map_err(|err| BackendError::Failed(format!("desligar {adapter}: {err}")))?;
     thread::sleep(Duration::from_millis(400));
-    let _ = wmi.exec_instance_method::<MSFT_NetAdapter, _, Ret>("Enable", &path, ());
+    wmi.exec_instance_method::<MSFT_NetAdapter, _, Ret>("Enable", &path, ()).map_err(|err| BackendError::Failed(format!("ligar {adapter}: {err}")))?;
+    crate::store::trace(&format!("n-eee reiniciei {adapter} guid {interface_guid}"));
+    Ok(())
 }
 
 fn read_printers() -> Result<Vec<String>, BackendError> {

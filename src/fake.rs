@@ -17,19 +17,26 @@ pub struct FakeBackend {
     registry: Vec<(Hive, String, RegKey)>,
     pub services: BTreeMap<String, ServiceInfo>,
     pub power: String,
+    pub schemes: Vec<PowerSchemeInfo>,
+    pub machine: MachineKind,
+    pub on_battery: bool,
+    pub created_power: Option<String>,
+    pub next_power: u32,
+    pub fail_nic: Option<String>,
+    pub adapter_restarts: u32,
     mouse: MouseAccel,
     pub mouse_speed: u32,
     sticky: u32,
     filter: u32,
     toggle: u32,
     pub display: DisplayInfo,
-    disks: Vec<DiskHealth>,
+    pub disks: Vec<DiskHealth>,
     events: Vec<DiskEventGroup>,
     pub disk_report: DiskReport,
     location: WindowsLocation,
-    adapters: Vec<AdapterInfo>,
+    pub adapters: Vec<AdapterInfo>,
     pub printers: Vec<String>,
-    startup: Vec<StartupEntry>,
+    pub startup: Vec<StartupEntry>,
     security: SecurityStatus,
     pub protection_enabled: bool,
     pub restore_frequency: Duration,
@@ -56,6 +63,13 @@ impl FakeBackend {
             registry: Vec::new(),
             services: BTreeMap::new(),
             power: ULTIMATE_PERFORMANCE_GUID.to_string(),
+            schemes: Vec::new(),
+            machine: MachineKind::Desktop,
+            on_battery: false,
+            created_power: None,
+            next_power: 1,
+            fail_nic: None,
+            adapter_restarts: 0,
             mouse: MouseAccel { threshold1: 0, threshold2: 0, enabled: 0 },
             mouse_speed: 10,
             sticky: 506,
@@ -191,6 +205,8 @@ impl FakeBackend {
         };
         s.adapters = vec![AdapterInfo {
             name: "Ethernet".into(),
+            interface_guid: "{C8E0BA2D-28FA-4DB2-91F4-68CC507F35BF}".into(),
+            description: "Realtek PCIe GbE Family Controller".into(),
             wired: true,
             connected: true,
             link_bps: 1_000_000_000,
@@ -319,7 +335,7 @@ impl SystemBackend for FakeBackend {
         self.services
             .get(name)
             .cloned()
-            .ok_or_else(|| BackendError::Failed(format!("serviço {name} não existe")))
+            .ok_or_else(|| BackendError::NotFound(format!("serviço {name} não existe")))
     }
 
     fn set_service_start(&mut self, name: &str, start: StartType) -> Result<(), BackendError> {
@@ -361,6 +377,54 @@ impl SystemBackend for FakeBackend {
             self.power = normalize_guid(guid);
         }
         Ok(())
+    }
+
+    fn power_schemes(&self) -> Result<Vec<PowerSchemeInfo>, BackendError> {
+        Ok(self.schemes.clone())
+    }
+
+    fn power_duplicate(&mut self, source_guid: &str) -> Result<String, BackendError> {
+        if self.fail_writes {
+            return Err(BackendError::Failed("não dupliquei o plano".into()));
+        }
+        let source = normalize_guid(source_guid);
+        let n = self.next_power;
+        self.next_power += 1;
+        let guid = format!("{:08x}-058a-42c5-b251-951cc5e9db6a", 0x1000_0000 + n);
+        let ultimate = source == ULTIMATE_PERFORMANCE_GUID;
+        self.schemes.push(PowerSchemeInfo {
+            guid: guid.clone(),
+            name: if ultimate { "Desempenho Máximo".into() } else { "Alto desempenho".into() },
+            personality: Some(1),
+            disk_timeout_ac: Some(if ultimate { 0 } else { 1200 }),
+            min_processor_ac: Some(100),
+        });
+        Ok(guid)
+    }
+
+    fn power_delete(&mut self, guid: &str) -> Result<(), BackendError> {
+        if crate::rules::is_builtin_scheme(guid) {
+            return Err(BackendError::Failed("não apago um plano embutido do Windows".into()));
+        }
+        let guid = normalize_guid(guid);
+        self.schemes.retain(|scheme| normalize_guid(&scheme.guid) != guid);
+        Ok(())
+    }
+
+    fn note_created_power_scheme(&mut self, guid: &str) {
+        self.created_power = Some(normalize_guid(guid));
+    }
+
+    fn take_created_power_scheme(&mut self) -> Option<String> {
+        self.created_power.take()
+    }
+
+    fn machine_kind(&self) -> MachineKind {
+        self.machine
+    }
+
+    fn on_battery(&self) -> bool {
+        self.on_battery
     }
 
     fn mouse_accel(&self) -> Result<MouseAccel, BackendError> {
@@ -455,16 +519,28 @@ impl SystemBackend for FakeBackend {
         Ok(self.adapters.clone())
     }
 
-    fn set_adapter_keyword(&mut self, adapter: &str, keyword: &str, value: &str) -> Result<(), BackendError> {
+    fn set_adapter_keyword(&mut self, adapter: &str, interface_guid: &str, keyword: &str, value: &str) -> Result<(), BackendError> {
+        if let Some(reason) = &self.fail_nic {
+            return Err(BackendError::Failed(reason.clone()));
+        }
         if self.fail_writes {
             return Ok(());
         }
-        let ad = self.adapters.iter_mut().find(|a| a.name.eq_ignore_ascii_case(adapter)).ok_or_else(|| BackendError::Failed("adaptador não encontrado".into()))?;
-        let prop = ad.power_props.iter_mut().find(|p| p.keyword.eq_ignore_ascii_case(keyword)).ok_or_else(|| BackendError::Failed("propriedade não encontrada".into()))?;
+        let ad = self
+            .adapters
+            .iter_mut()
+            .find(|a| crate::rules::guids_equal(&a.interface_guid, interface_guid) || a.name.eq_ignore_ascii_case(adapter))
+            .ok_or_else(|| BackendError::Failed(format!("não achei a chave da placa {adapter}")))?;
+        let prop = ad.power_props.iter_mut().find(|p| p.keyword.eq_ignore_ascii_case(keyword)).ok_or_else(|| BackendError::Failed(format!("propriedade {keyword} não existe nesta placa")))?;
         prop.current = value.to_string();
         if value == prop.disabled_value {
             prop.current_display = prop.disabled_display.clone();
         }
+        Ok(())
+    }
+
+    fn restart_adapter(&mut self, _adapter: &str, _interface_guid: &str) -> Result<(), BackendError> {
+        self.adapter_restarts += 1;
         Ok(())
     }
 

@@ -2,8 +2,8 @@
 1 ICON "turbo.ico"
 
 1 VERSIONINFO
-FILEVERSION 1,0,2,0
-PRODUCTVERSION 1,0,2,0
+FILEVERSION 1,1,0,0
+PRODUCTVERSION 1,1,0,0
 FILEFLAGSMASK 0x3fL
 FILEFLAGS 0x0L
 FILEOS 0x40004L
@@ -16,11 +16,11 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "NoShaar"
             VALUE "FileDescription", "Turbo App"
-            VALUE "FileVersion", "1.0.2"
+            VALUE "FileVersion", "1.1.0"
             VALUE "InternalName", "turbo-app"
             VALUE "OriginalFilename", "turbo-app.exe"
             VALUE "ProductName", "Turbo App"
-            VALUE "ProductVersion", "1.0.2"
+            VALUE "ProductVersion", "1.1.0"
         END
     END
     BLOCK "VarFileInfo"

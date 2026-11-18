@@ -72,9 +72,9 @@ Não há serviço nem tarefa agendada. Ao abrir, e no botão **Verificar atualiz
 
 Não precisa de `update-source.url`. Esse arquivo, ou a variável `TURBO_UPDATE_MANIFEST_URL`, só entra se você quiser apontar para outro manifesto.
 
-O manifesto é o JSON de `releases/latest.json`. O instalador da versão 1.0.1 fica em:
+O manifesto é o JSON de `releases/latest.json`. O instalador da versão 1.1.0 fica em:
 
-`https://github.com/NoShaar/turbo-app/releases/download/v1.0.2/TurboApp-Setup.exe`
+`https://github.com/NoShaar/turbo-app/releases/download/v1.1.0/TurboApp-Setup.exe`
 
 Se houver versão nova, o app mostra as notas. Se você aceitar, ele baixa o instalador, confere o **SHA-256** e a **assinatura Ed25519** com a chave pública embutida no exe, e só então inicia a instalação. Hash ou assinatura diferentes: o arquivo é descartado e nada é instalado.
 
@@ -118,6 +118,8 @@ O checklist de Valorant, LoL, AMD Software e BIOS fica na aba **Checklist manual
 Um panic grava a mensagem e o backtrace em `%LOCALAPPDATA%\TurboApp\crash.log` e mostra uma caixa de diálogo. A 1.0.0 fechava na hora, sem janela, porque o diagnóstico inicializava COM em modo multithread na thread da interface e o winit recusava o `OleInitialize` (`RPC_E_CHANGED_MODE`, exceção `0xc0000409`). A partir da 1.0.1 o WMI e o resto do COM rodam numa thread de trabalho; a thread da janela fica livre para o modo STA.
 
 A 1.0.2 pede administrador ao abrir (UAC). O instalador continua por usuário, em `%LOCALAPPDATA%\TurboApp\app`, e o atalho abre o exe, que então pede elevação. Cada leitura e cada ação vai para `%LOCALAPPDATA%\TurboApp\turbo.log`. Uma consulta que falha marca só aquele item como não lido.
+
+A 1.1.0 reconhece Desempenho Máximo mesmo quando o plano foi duplicado, desliga a economia da placa pelo RegistryKeyword (e pelo GUID, sem depender do nome "Ethernet" nem do idioma) e marca "Não se aplica" quando o hardware ou a chave não existe. Em notebook, o plano de alto desempenho avisa que gasta mais bateria. Itens novos seguem `CONTRIBUTING.md`.
 
 ## Compilar e rodar
 

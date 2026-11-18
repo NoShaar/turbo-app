@@ -4,6 +4,8 @@ export struct NavEntry {
     id: string,
     label: string,
     hint: string,
+    icon: string,
+    header: string,
 }
 
 export struct Card {
@@ -32,10 +34,38 @@ export struct Row3 {
     c: string,
 }
 
+component Glyph inherits Path {
+    in property <string> kind;
+    in property <color> ink: #c5ccd6;
+    width: 16px;
+    height: 16px;
+    viewbox-width: 24;
+    viewbox-height: 24;
+    stroke: root.ink;
+    stroke-width: 1.7px;
+    fill: transparent;
+    commands: root.kind == "disk" ? "M 5 8 H 19 V 16 H 5 Z M 5 12 H 19" :
+        root.kind == "bolt" ? "M 13 3 L 6 13 H 11 L 10 21 L 18 10 H 13 Z" :
+        root.kind == "mouse" ? "M 8 9 A 4 4 0 0 1 16 9 V 16 A 4 4 0 0 1 8 16 Z M 12 9 V 13" :
+        root.kind == "keyboard" ? "M 3 7 H 21 V 17 H 3 Z M 7 11 H 7.1 M 12 11 H 12.1 M 17 11 H 17.1 M 8 14 H 16" :
+        root.kind == "monitor" ? "M 4 5 H 20 V 15 H 4 Z M 9 19 H 15 M 12 15 V 19" :
+        root.kind == "net" ? "M 12 4 V 20 M 4 12 H 20 M 7 7 L 17 17 M 17 7 L 7 17" :
+        root.kind == "service" ? "M 12 4 L 19 8 V 16 L 12 20 L 5 16 V 8 Z" :
+        root.kind == "startup" ? "M 6 18 V 6 H 14 L 18 10 V 18 Z" :
+        root.kind == "shield" ? "M 12 3 L 19 6 V 12 C 19 16 16 19 12 21 C 8 19 5 16 5 12 V 6 Z" :
+        root.kind == "game" ? "M 4 10 H 20 V 16 H 4 Z M 8 13 H 10 M 9 12 V 14 M 15 13 H 15.1 M 17 13 H 17.1" :
+        root.kind == "list" ? "M 5 7 H 19 M 5 12 H 19 M 5 17 H 14" :
+        root.kind == "log" ? "M 7 4 H 17 V 20 H 7 Z M 10 9 H 14 M 10 13 H 14 M 10 17 H 13" :
+        root.kind == "info" ? "M 12 4 A 8 8 0 1 0 12 20 A 8 8 0 1 0 12 4 M 12 11 V 16 M 12 8 H 12.1" :
+        "M 5 11 L 12 5 L 19 11 V 19 H 14 V 14 H 10 V 19 H 5 Z";
+}
+
 component Pill inherits Rectangle {
     in property <string> text;
     in property <color> tone: #3ddc97;
     height: 22px;
+    vertical-stretch: 0;
+    horizontal-stretch: 0;
     border-radius: 11px;
     background: root.tone.with-alpha(0.16);
     border-width: 1px;
@@ -59,14 +89,19 @@ component Btn inherits Rectangle {
     in property <bool> enabled: true;
     in property <bool> primary: false;
     callback clicked();
+    property <bool> hot: area.has-hover && root.enabled;
+    property <bool> down: area.pressed && root.enabled;
+    property <color> fill: !root.enabled ? #2a3038 : root.down ? (root.primary ? #d94422 : #242a33) : root.hot ? (root.primary ? #ff734f : #364050) : root.primary ? #ff5a36 : #2c3440;
+    animate fill { duration: 160ms; easing: ease-out; }
     horizontal-stretch: 0;
-    height: 36px;
-    min-width: 120px;
+    vertical-stretch: 0;
+    height: 34px;
+    min-width: 108px;
     border-radius: 8px;
-    background: !root.enabled ? #2a3038 : root.primary ? #ff5a36 : #2c3440;
+    background: root.fill;
     border-width: 1px;
     border-color: root.primary ? #ff5a36 : #3c4654;
-    TouchArea {
+    area := TouchArea {
         enabled: root.enabled;
         mouse-cursor: pointer;
         clicked => { root.clicked(); }
@@ -85,33 +120,89 @@ component Stat inherits Rectangle {
     in property <string> value;
     in property <string> label;
     in property <color> tone: #f4f7fb;
-    height: 78px;
+    height: 72px;
+    vertical-stretch: 0;
+    horizontal-stretch: 1;
     border-radius: 12px;
     background: #1c2027;
     border-width: 1px;
     border-color: #2d333d;
     VerticalLayout {
         padding: 12px;
-        alignment: center;
-        Text { text: root.value; color: root.tone; font-size: 26px; font-weight: 700; }
-        Text { text: root.label; color: #9aa3af; font-size: 12px; }
+        alignment: start;
+        spacing: 2px;
+        Text { text: root.value; color: root.tone; font-size: 22px; font-weight: 700; vertical-stretch: 0; }
+        Text { text: root.label; color: #9aa3af; font-size: 12px; vertical-stretch: 0; }
+    }
+}
+
+component Ring inherits Rectangle {
+    in property <int> value;
+    width: 84px;
+    height: 84px;
+    vertical-stretch: 0;
+    horizontal-stretch: 0;
+    border-radius: 42px;
+    border-width: 7px;
+    border-color: #ff5a36;
+    background: #101114;
+    property <float> shown: min(100, max(0, root.value)) / 100;
+    animate shown { duration: 220ms; easing: ease-out; }
+    Path {
+        width: 100%;
+        height: 100%;
+        viewbox-width: 100;
+        viewbox-height: 100;
+        stroke: #2a3038;
+        stroke-width: 8px;
+        commands: "M 50 8 A 42 42 0 1 1 49.9 8";
+    }
+    arc := Path {
+        width: 100%;
+        height: 100%;
+        viewbox-width: 100;
+        viewbox-height: 100;
+        stroke: #ff5a36;
+        stroke-width: 8px;
+        property <float> progress: min(0.999, max(0.001, root.shown));
+        MoveTo {
+            x: 50;
+            y: 8;
+        }
+        ArcTo {
+            radius-x: 42;
+            radius-y: 42;
+            x: 50 - 42 * sin(-arc.progress * 360deg);
+            y: 50 - 42 * cos(-arc.progress * 360deg);
+            sweep: true;
+            large-arc: arc.progress > 0.5;
+        }
+    }
+    Text {
+        text: root.value;
+        color: #f4f7fb;
+        font-size: 22px;
+        font-weight: 700;
+        horizontal-alignment: center;
+        vertical-alignment: center;
     }
 }
 
 export component MainWindow inherits Window {
     title: "Turbo";
-    preferred-width: 1180px;
-    preferred-height: 760px;
-    min-width: 880px;
-    min-height: 620px;
+    preferred-width: 1280px;
+    preferred-height: 800px;
+    min-width: 1100px;
+    min-height: 700px;
     background: #101114;
-    default-font-family: "Segoe UI";
+    default-font-family: "Segoe UI Variable, Segoe UI";
     default-font-size: 14px;
     default-font-weight: 400;
 
     in-out property <string> page: "home";
     in-out property <string> section-title: "Início";
     in-out property <string> section-id: "home";
+    in-out property <string> section-blurb: "";
     in-out property <[NavEntry]> nav;
     in-out property <[Card]> cards;
     in-out property <[Row3]> rows;
@@ -120,6 +211,11 @@ export component MainWindow inherits Window {
     in-out property <string> ok-count: "0";
     in-out property <string> improve-count: "0";
     in-out property <string> unread-count: "0";
+    in-out property <int> score: 0;
+    in-out property <string> hw-cpu: "—";
+    in-out property <string> hw-gpu: "—";
+    in-out property <string> hw-ram: "—";
+    in-out property <string> hw-monitor: "—";
     in-out property <string> critical: "";
     in-out property <bool> busy: false;
     in-out property <string> busy-text: "";
@@ -129,13 +225,16 @@ export component MainWindow inherits Window {
     in-out property <string> dialog-primary: "Continuar";
     in-out property <string> dialog-secondary: "Cancelar";
     in-out property <bool> dialog-secondary-visible: true;
+    in-out property <string> dialog-alt: "";
+    in-out property <bool> dialog-alt-visible: false;
     in-out property <bool> update-open: false;
     in-out property <string> update-title: "";
     in-out property <string> update-body: "";
     in-out property <string> toast: "";
+    in-out property <string> toast-kind: "info";
     in-out property <string> log-text: "";
     in-out property <bool> elevated: true;
-    in-out property <string> version-label: "1.0.2";
+    in-out property <string> version-label: "1.1.0";
 
     callback nav-clicked(string);
     callback optimize(string);
@@ -151,6 +250,7 @@ export component MainWindow inherits Window {
     callback check-updates();
     callback accept-dialog();
     callback cancel-dialog();
+    callback alt-dialog();
     callback update-accept();
     callback update-later();
     callback relaunch-admin();
@@ -160,11 +260,13 @@ export component MainWindow inherits Window {
             width: 248px;
             background: #16181d;
             VerticalLayout {
-                padding: 18px;
-                spacing: 4px;
+                padding: 16px;
+                spacing: 2px;
+                alignment: start;
                 HorizontalLayout {
                     spacing: 10px;
                     alignment: start;
+                    vertical-stretch: 0;
                     Rectangle {
                         width: 36px;
                         height: 36px;
@@ -173,7 +275,7 @@ export component MainWindow inherits Window {
                         Text {
                             text: "T";
                             color: #1a0d0a;
-                            font-size: 20px;
+                            font-size: 18px;
                             font-weight: 800;
                             horizontal-alignment: center;
                             vertical-alignment: center;
@@ -181,71 +283,79 @@ export component MainWindow inherits Window {
                     }
                     VerticalLayout {
                         alignment: center;
-                        Text { text: "Turbo"; color: #f4f7fb; font-size: 18px; font-weight: 700; }
-                        Text { text: "Valorant e LoL"; color: #9aa3af; font-size: 11px; }
+                        spacing: 0px;
+                        Text { text: "Turbo"; color: #f4f7fb; font-size: 16px; font-weight: 700; vertical-stretch: 0; }
+                        Text { text: "Valorant e LoL"; color: #9aa3af; font-size: 11px; vertical-stretch: 0; }
                     }
                 }
-                Rectangle { height: 14px; }
-                for item in root.nav: Rectangle {
-                    height: 36px;
-                    border-radius: 8px;
-                    background: root.section-id == item.id ? #2a241f : #0000;
-                    TouchArea {
-                        mouse-cursor: pointer;
-                        clicked => { root.nav-clicked(item.id); }
+                Rectangle { height: 12px; vertical-stretch: 0; }
+                for item in root.nav: VerticalLayout {
+                    spacing: 2px;
+                    alignment: start;
+                    vertical-stretch: 0;
+                    if item.header != "": Text {
+                        text: item.header;
+                        color: #6d7580;
+                        font-size: 11px;
+                        font-weight: 700;
+                        vertical-stretch: 0;
                     }
-                    HorizontalLayout {
-                        padding-left: 10px;
-                        padding-right: 10px;
-                        spacing: 8px;
-                        alignment: start;
-                        Text {
-                            text: item.label;
-                            color: root.section-id == item.id ? #ffb199 : #d5dbe3;
-                            font-size: 13px;
-                            vertical-alignment: center;
-                            font-weight: root.section-id == item.id ? 600 : 400;
+                    row := Rectangle {
+                        height: 34px;
+                        vertical-stretch: 0;
+                        border-radius: 8px;
+                        property <bool> on: root.section-id == item.id;
+                        property <color> fill: row.on ? #2a241f : nav-area.has-hover ? #22262c : #0000;
+                        animate fill { duration: 160ms; easing: ease-out; }
+                        background: self.fill;
+                        nav-area := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { root.nav-clicked(item.id); }
                         }
-                        Rectangle { horizontal-stretch: 1; }
-                        Text {
-                            text: item.hint;
-                            color: #8b93a0;
-                            font-size: 11px;
-                            vertical-alignment: center;
+                        HorizontalLayout {
+                            alignment: start;
+                            spacing: 8px;
+                            padding-left: 8px;
+                            padding-right: 8px;
+                            Rectangle {
+                                width: 3px;
+                                height: 16px;
+                                vertical-stretch: 0;
+                                border-radius: 2px;
+                                background: row.on ? #ff5a36 : #0000;
+                            }
+                            Glyph { kind: item.icon; ink: row.on ? #ffb199 : #9aa3af; }
+                            Text {
+                                text: item.label;
+                                color: row.on ? #ffb199 : #d5dbe3;
+                                font-size: 13px;
+                                font-weight: row.on ? 600 : 400;
+                                vertical-alignment: center;
+                            }
+                            Rectangle { horizontal-stretch: 1; }
+                            if item.hint != "": Text {
+                                text: item.hint;
+                                color: #f5c16c;
+                                font-size: 11px;
+                                font-weight: 700;
+                                vertical-alignment: center;
+                            }
                         }
                     }
                 }
                 Rectangle { vertical-stretch: 1; }
-                Text { text: "v" + root.version-label; color: #6d7580; font-size: 11px; }
-                Text { text: "Sem serviço em segundo plano"; color: #6d7580; font-size: 11px; wrap: word-wrap; }
+                Btn { label: "Reverter tudo"; clicked => { root.revert-all(); } }
+                Rectangle { height: 8px; vertical-stretch: 0; }
+                Text { text: "v" + root.version-label; color: #6d7580; font-size: 11px; vertical-stretch: 0; }
+                Text { text: "Sem serviço em segundo plano"; color: #6d7580; font-size: 11px; wrap: word-wrap; vertical-stretch: 0; }
             }
         }
 
         VerticalLayout {
-            Rectangle {
-                height: 64px;
-                background: #14171c;
-                HorizontalLayout {
-                    padding-left: 22px;
-                    padding-right: 18px;
-                    spacing: 10px;
-                    alignment: center;
-                    VerticalLayout {
-                        alignment: center;
-                        Text { text: root.section-title; color: #f4f7fb; font-size: 18px; font-weight: 700; }
-                    }
-                    Rectangle { horizontal-stretch: 1; }
-                    if root.page == "section": HorizontalLayout {
-                        spacing: 8px;
-                        alignment: center;
-                        Btn { label: "Otimizar tudo da seção"; primary: true; clicked => { root.optimize-section(); } }
-                        Btn { label: "Reverter seção"; clicked => { root.revert-section(); } }
-                    }
-                    Btn { label: "Reverter tudo"; clicked => { root.revert-all(); } }
-                }
-            }
+            alignment: start;
             if root.banner != "": Rectangle {
-                height: 36px;
+                height: 32px;
+                vertical-stretch: 0;
                 background: #3a2a14;
                 Text {
                     text: root.banner;
@@ -256,15 +366,16 @@ export component MainWindow inherits Window {
                 }
             }
             if !root.elevated: Rectangle {
-                min-height: 48px;
+                vertical-stretch: 0;
                 background: #3a2a14;
                 HorizontalLayout {
+                    padding: 10px;
                     padding-left: 16px;
                     padding-right: 16px;
                     spacing: 12px;
                     alignment: center;
                     Text {
-                        text: "Rodando sem administrador. Backup, HKLM, serviços, rede e SMART ficam bloqueados.";
+                        text: "Conta sem administrador. Backup, HKLM, serviços, rede e SMART ficam bloqueados até você reabrir elevado.";
                         color: #f5c16c;
                         font-size: 12px;
                         wrap: word-wrap;
@@ -275,242 +386,436 @@ export component MainWindow inherits Window {
                 }
             }
             Rectangle {
+                vertical-stretch: 1;
                 background: #101114;
-                if root.page == "home": ScrollView {
+                VerticalLayout {
+                if root.page == "home": Rectangle {
+                    vertical-stretch: 1;
                     VerticalLayout {
                         alignment: start;
-                        padding: 22px;
-                        spacing: 12px;
-                        Text {
-                            text: "Otimização segura, reversível e sem placebo.";
-                            color: #f4f7fb;
-                            font-size: 22px;
-                            font-weight: 700;
-                            wrap: word-wrap;
+                        padding: 24px;
+                        spacing: 14px;
+                        Rectangle {
+                            height: 128px;
                             vertical-stretch: 0;
-                        }
-                        Text {
-                            text: "O Turbo lê o PC primeiro. Só muda o que está na especificação, guarda o valor original e confirma a leitura depois. Fechou a janela, não sobra processo.";
-                            color: #9aa3af;
-                            wrap: word-wrap;
-                            vertical-stretch: 0;
-                        }
-                        HorizontalLayout {
-                            spacing: 12px;
-                            vertical-stretch: 0;
-                            Stat { value: root.ok-count; label: "OK"; tone: #3ddc97; }
-                            Stat { value: root.improve-count; label: "Pode melhorar"; tone: #f5c16c; }
-                            Stat { value: root.unread-count; label: "Não lido / admin"; tone: #8eb6ff; }
+                            background: #16181d;
+                            border-radius: 12px;
+                            Text { x: 16px; y: 16px; text: "Início"; color: #f4f7fb; font-size: 26px; font-weight: 700; }
+                            Text {
+                                x: 16px;
+                                y: 52px;
+                                width: 680px;
+                                height: 44px;
+                                text: "O Turbo lê o PC primeiro. Só muda o que está na especificação, guarda o valor original e confirma a leitura depois.";
+                                color: #9aa3af;
+                                font-size: 13px;
+                                wrap: word-wrap;
+                            }
+                            Ring { x: parent.width - 120px; y: 16px; value: root.score; }
+                            Text {
+                                x: parent.width - 150px;
+                                y: 108px;
+                                width: 140px;
+                                text: "dos itens que se aplicam";
+                                color: #6d7580;
+                                font-size: 11px;
+                                horizontal-alignment: center;
+                            }
                         }
                         Rectangle {
+                            height: 84px;
                             vertical-stretch: 0;
-                            background: #1c2027;
-                            border-radius: 14px;
-                            border-width: 1px;
-                            border-color: #ff5a36;
-                            VerticalLayout {
+                            horizontal-stretch: 1;
+                            HorizontalLayout {
+                                spacing: 12px;
                                 alignment: start;
-                                padding: 16px;
+                                Stat { value: root.ok-count; label: "OK"; tone: #3ddc97; }
+                                Stat { value: root.improve-count; label: "Pode melhorar"; tone: #f5c16c; }
+                                Stat { value: root.unread-count; label: "Não lido"; tone: #8eb6ff; }
+                            }
+                        }
+                        Rectangle {
+                            height: 76px;
+                            vertical-stretch: 0;
+                            horizontal-stretch: 1;
+                            HorizontalLayout {
                                 spacing: 8px;
-                                Text { text: "Backup antes da primeira alteração"; color: #f4f7fb; font-weight: 700; font-size: 16px; vertical-stretch: 0; }
-                                Text { text: root.backup-text; color: #c5ccd6; wrap: word-wrap; vertical-stretch: 0; }
-                                HorizontalLayout {
+                                alignment: start;
+                                Rectangle { horizontal-stretch: 1; border-radius: 10px; background: #1c2027; border-width: 1px; border-color: #2d333d; VerticalLayout { padding: 10px; spacing: 2px; alignment: start; Text { text: "CPU"; color: #6d7580; font-size: 11px; vertical-stretch: 0; } Text { text: root.hw-cpu; color: #f4f7fb; font-size: 13px; wrap: word-wrap; vertical-stretch: 0; } } }
+                                Rectangle { horizontal-stretch: 1; border-radius: 10px; background: #1c2027; border-width: 1px; border-color: #2d333d; VerticalLayout { padding: 10px; spacing: 2px; alignment: start; Text { text: "GPU"; color: #6d7580; font-size: 11px; vertical-stretch: 0; } Text { text: root.hw-gpu; color: #f4f7fb; font-size: 13px; wrap: word-wrap; vertical-stretch: 0; } } }
+                                Rectangle { horizontal-stretch: 1; border-radius: 10px; background: #1c2027; border-width: 1px; border-color: #2d333d; VerticalLayout { padding: 10px; spacing: 2px; alignment: start; Text { text: "RAM"; color: #6d7580; font-size: 11px; vertical-stretch: 0; } Text { text: root.hw-ram; color: #f4f7fb; font-size: 13px; wrap: word-wrap; vertical-stretch: 0; } } }
+                                Rectangle { horizontal-stretch: 1; border-radius: 10px; background: #1c2027; border-width: 1px; border-color: #2d333d; VerticalLayout { padding: 10px; spacing: 2px; alignment: start; Text { text: "Monitor"; color: #6d7580; font-size: 11px; vertical-stretch: 0; } Text { text: root.hw-monitor; color: #f4f7fb; font-size: 13px; wrap: word-wrap; vertical-stretch: 0; } } }
+                            }
+                        }
+                        Rectangle {
+                            height: 148px;
+                            vertical-stretch: 0;
+                            Rectangle {
+                                background: #1c2027;
+                                border-radius: 12px;
+                                border-width: 1px;
+                                border-color: #2d333d;
+                                VerticalLayout {
+                                    alignment: start;
+                                    padding: 14px;
                                     spacing: 8px;
-                                    vertical-stretch: 0;
-                                    Btn {
-                                        label: root.elevated ? "Criar backup agora" : "Precisa de admin";
-                                        primary: root.elevated;
-                                        enabled: root.elevated;
-                                        clicked => { root.create-backup(); }
+                                    Text { text: "Backup"; color: #f4f7fb; font-weight: 700; font-size: 16px; vertical-stretch: 0; }
+                                    Text { text: root.backup-text; color: #c5ccd6; font-size: 13px; wrap: word-wrap; vertical-stretch: 0; }
+                                    HorizontalLayout {
+                                        spacing: 8px;
+                                        vertical-stretch: 0;
+                                        Btn { label: root.elevated ? "Criar backup agora" : "Precisa de admin"; primary: root.elevated; enabled: root.elevated; clicked => { root.create-backup(); } }
+                                        Btn { label: "Ler de novo"; clicked => { root.diagnose(); } }
+                                        Btn { label: "Medir disco (10 s)"; clicked => { root.measure-disk(); } }
+                                        Btn { label: "Verificar atualizações"; clicked => { root.check-updates(); } }
                                     }
-                                    Btn { label: "Ler de novo"; clicked => { root.diagnose(); } }
-                                    Btn { label: "Medir disco (10 s)"; clicked => { root.measure-disk(); } }
-                                    Btn { label: "Verificar atualizações"; clicked => { root.check-updates(); } }
                                 }
                             }
                         }
                         if root.critical != "": Rectangle {
+                            height: 168px;
                             vertical-stretch: 0;
-                            background: #1c2027;
-                            border-radius: 14px;
-                            border-width: 1px;
-                            border-color: #2d333d;
-                            VerticalLayout {
-                                padding: 16px;
-                                spacing: 6px;
-                                Text { text: "Pontos que merecem olhar primeiro"; color: #f4f7fb; font-weight: 700; }
-                                Text { text: root.critical; color: #c5ccd6; wrap: word-wrap; }
+                            Rectangle {
+                                background: #1c2027;
+                                border-radius: 12px;
+                                border-width: 1px;
+                                border-color: #2d333d;
+                                VerticalLayout {
+                                    alignment: start;
+                                    padding: 14px;
+                                    spacing: 6px;
+                                    Text { text: "Olhar primeiro"; color: #f4f7fb; font-weight: 700; font-size: 16px; vertical-stretch: 0; }
+                                    Text { text: root.critical; color: #c5ccd6; font-size: 13px; wrap: word-wrap; vertical-stretch: 0; }
+                                }
                             }
                         }
                     }
                 }
-                if root.page == "section": ScrollView {
-                    VerticalLayout {
-                        padding: 18px;
+                if root.page == "section": sec := Rectangle {
+                    vertical-stretch: 1;
+                    property <length> shift: 0px;
+                    TouchArea {
+                        scroll-event(event) => {
+                            sec.shift = max(sec.height - 1400px, min(0px, sec.shift + event.delta-y));
+                            accept
+                        }
+                    }
+                    Rectangle {
+                        y: sec.shift;
+                        x: 0px;
+                        width: parent.width;
+                        height: 1400px;
+                        VerticalLayout {
+                        alignment: start;
+                        padding: 24px;
                         spacing: 12px;
-                        for card in root.cards: Rectangle {
-                            background: #1c2027;
-                            border-radius: 14px;
-                            border-width: 1px;
-                            border-color: #2d333d;
+                        Rectangle {
+                            height: 108px;
+                            vertical-stretch: 0;
                             VerticalLayout {
-                                padding: 16px;
+                                alignment: start;
                                 spacing: 8px;
+                                Text { text: root.section-title; color: #f4f7fb; font-size: 26px; font-weight: 700; vertical-stretch: 0; }
+                                Text { text: root.section-blurb; color: #9aa3af; font-size: 13px; wrap: word-wrap; vertical-stretch: 0; }
                                 HorizontalLayout {
                                     spacing: 8px;
-                                    alignment: center;
-                                    Text { text: card.name; color: #f4f7fb; font-size: 16px; font-weight: 700; vertical-alignment: center; }
-                                    Rectangle { horizontal-stretch: 1; }
-                                    Pill { text: card.seal; tone: card.seal == "SEGURO" ? #3ddc97 : #f5c16c; }
-                                    Pill {
-                                        text: card.state;
-                                        tone: card.kind == "ok" ? #3ddc97 : card.kind == "improve" ? #f5c16c : #8eb6ff;
-                                    }
-                                }
-                                Text { text: card.faz; color: #d5dbe3; wrap: word-wrap; }
-                                Text { text: card.ajuda; color: #9aa3af; font-size: 12px; wrap: word-wrap; }
-                                Text { text: card.detail; color: #e7ebf0; font-size: 13px; wrap: word-wrap; }
-                                if card.caveat != "": Text { text: card.caveat; color: #f5c16c; font-size: 12px; wrap: word-wrap; }
-                                Text { text: "Admin: " + card.admin + "   ·   Reinício: " + card.reboot; color: #6d7580; font-size: 11px; wrap: word-wrap; }
-                                HorizontalLayout {
-                                    spacing: 8px;
-                                    if card.can-optimize: Btn {
-                                        label: card.admin-locked ? "Precisa de admin" : "Otimizar";
-                                        primary: !card.admin-locked;
-                                        enabled: !card.admin-locked;
-                                        clicked => { root.optimize(card.id); }
-                                    }
-                                    if card.can-revert: Btn { label: "Reverter"; clicked => { root.revert(card.id); } }
-                                    if card.needs-admin-read: Btn { label: "Ler como admin"; clicked => { root.read-admin(card.id); } }
-                                    if card.show-resmon: Btn { label: "Abrir Monitor de Recursos"; clicked => { root.open-resmon(); } }
-                                    Rectangle { horizontal-stretch: 1; }
+                                    vertical-stretch: 0;
+                                    Btn { label: "Otimizar tudo"; primary: true; clicked => { root.optimize-section(); } }
+                                    Btn { label: "Reverter seção"; clicked => { root.revert-section(); } }
                                 }
                             }
                         }
+                        for card in root.cards: Rectangle {
+                            height: 210px;
+                            vertical-stretch: 0;
+                            Rectangle {
+                                background: card-area.has-hover ? #222833 : #1c2027;
+                                animate background { duration: 160ms; easing: ease-out; }
+                                border-radius: 12px;
+                                border-width: 1px;
+                                border-color: #2d333d;
+                                card-area := TouchArea {}
+                                VerticalLayout {
+                                    alignment: start;
+                                    padding: 14px;
+                                    spacing: 6px;
+                                    HorizontalLayout {
+                                        spacing: 8px;
+                                        alignment: center;
+                                        vertical-stretch: 0;
+                                        Text { text: card.name; color: #f4f7fb; font-size: 16px; font-weight: 700; vertical-alignment: center; vertical-stretch: 0; }
+                                        Rectangle { horizontal-stretch: 1; }
+                                        Pill { text: card.seal; tone: card.seal == "Seguro" ? #3ddc97 : #f5c16c; }
+                                        Pill { text: card.state; tone: card.kind == "ok" ? #3ddc97 : card.kind == "improve" ? #f5c16c : card.kind == "na" ? #8b93a0 : #8eb6ff; }
+                                    }
+                                    Text { text: card.faz; color: #d5dbe3; font-size: 13px; wrap: word-wrap; vertical-stretch: 0; }
+                                    Text { text: card.detail; color: #e7ebf0; font-size: 13px; wrap: word-wrap; vertical-stretch: 0; }
+                                    if card.caveat != "": Text { text: card.caveat; color: #f5c16c; font-size: 12px; wrap: word-wrap; vertical-stretch: 0; }
+                                    Text { text: "Admin: " + card.admin + "   ·   Reinício: " + card.reboot; color: #6d7580; font-size: 12px; wrap: word-wrap; vertical-stretch: 0; }
+                                    HorizontalLayout {
+                                        spacing: 8px;
+                                        vertical-stretch: 0;
+                                        if card.can-optimize: Btn {
+                                            label: card.admin-locked ? "Precisa de admin" : root.busy ? "Aplicando..." : "Otimizar";
+                                            primary: !card.admin-locked && !root.busy;
+                                            enabled: !card.admin-locked && !root.busy;
+                                            clicked => { root.optimize(card.id); }
+                                        }
+                                        if card.can-revert: Btn { label: "Reverter"; enabled: !root.busy; clicked => { root.revert(card.id); } }
+                                        if card.needs-admin-read: Btn { label: "Ler como admin"; clicked => { root.read-admin(card.id); } }
+                                        if card.show-resmon: Btn { label: "Abrir Monitor de Recursos"; clicked => { root.open-resmon(); } }
+                                    }
+                                }
+                            }
+                        }
+                        }
                     }
                 }
-                if root.page == "table": ScrollView {
+                if root.page == "table": Rectangle {
+                    vertical-stretch: 1;
                     VerticalLayout {
-                        padding: 18px;
-                        spacing: 8px;
-                        for row in root.rows: Rectangle {
-                            background: #1c2027;
-                            border-radius: 12px;
-                            border-width: 1px;
-                            border-color: #2d333d;
+
+                        alignment: start;
+                        padding: 24px;
+                        spacing: 12px;
+                        Rectangle {
+                            height: 72px;
+                            vertical-stretch: 0;
                             VerticalLayout {
-                                padding: 14px;
-                                spacing: 4px;
-                                Text { text: row.a; color: #f4f7fb; font-weight: 600; wrap: word-wrap; }
-                                Text { text: row.b; color: #c5ccd6; font-size: 13px; wrap: word-wrap; }
-                                Text { text: row.c; color: #8eb6ff; font-size: 11px; wrap: word-wrap; }
+                                alignment: start;
+                                spacing: 6px;
+                                Text { text: root.section-title; color: #f4f7fb; font-size: 26px; font-weight: 700; vertical-stretch: 0; }
+                                Text { text: root.section-blurb; color: #9aa3af; font-size: 13px; wrap: word-wrap; vertical-stretch: 0; }
+                            }
+                        }
+                        for row in root.rows: Rectangle {
+                            height: 96px;
+                            vertical-stretch: 0;
+                            Rectangle {
+                                background: #1c2027;
+                                border-radius: 12px;
+                                border-width: 1px;
+                                border-color: #2d333d;
+                                VerticalLayout {
+                                    alignment: start;
+                                    padding: 14px;
+                                    spacing: 4px;
+                                    Text { text: row.a; color: #f4f7fb; font-weight: 600; wrap: word-wrap; vertical-stretch: 0; }
+                                    Text { text: row.b; color: #c5ccd6; font-size: 13px; wrap: word-wrap; vertical-stretch: 0; }
+                                    if row.c != "": Text { text: row.c; color: #8eb6ff; font-size: 12px; wrap: word-wrap; vertical-stretch: 0; }
+                                }
                             }
                         }
                     }
                 }
-                if root.page == "log": ScrollView {
+                if root.page == "log": Rectangle {
+                    vertical-stretch: 1;
                     VerticalLayout {
-                        padding: 18px;
-                        Text {
-                            text: root.log-text == "" ? "Nenhuma alteração registrada ainda." : root.log-text;
-                            color: #d5dbe3;
-                            font-family: "Cascadia Mono, Consolas, monospace";
-                            font-size: 12px;
-                            wrap: word-wrap;
+
+                        alignment: start;
+                        padding: 24px;
+                        spacing: 12px;
+                        Rectangle {
+                            height: 64px;
+                            vertical-stretch: 0;
+                            VerticalLayout {
+                                alignment: start;
+                                spacing: 6px;
+                                Text { text: "Log"; color: #f4f7fb; font-size: 26px; font-weight: 700; vertical-stretch: 0; }
+                                Text { text: "Cada Otimizar e cada Reverter grava o passo e o erro aqui e em turbo.log."; color: #9aa3af; font-size: 13px; wrap: word-wrap; vertical-stretch: 0; }
+                            }
+                        }
+                        Rectangle {
+                            height: 420px;
+                            vertical-stretch: 0;
+                            Rectangle {
+                                background: #1c2027;
+                                border-radius: 12px;
+                                border-width: 1px;
+                                border-color: #2d333d;
+                                VerticalLayout {
+                                    alignment: start;
+                                    padding: 14px;
+                                    Text {
+                                        text: root.log-text == "" ? "Nenhuma alteração registrada ainda." : root.log-text;
+                                        color: #d5dbe3;
+                                        font-family: "Cascadia Mono, Consolas, monospace";
+                                        font-size: 12px;
+                                        wrap: word-wrap;
+                                        vertical-stretch: 0;
+                                    }
+                                }
+                            }
                         }
                     }
                 }
-                if root.page == "about": ScrollView {
+                if root.page == "about": Rectangle {
+                    vertical-stretch: 1;
                     VerticalLayout {
-                        padding: 22px;
+
+                        alignment: start;
+                        padding: 24px;
                         spacing: 10px;
-                        Text { text: "Turbo " + root.version-label; color: #f4f7fb; font-size: 22px; font-weight: 700; }
-                        Text { text: "Made with Slint"; color: #ffb199; font-weight: 700; }
-                        Text {
-                            text: "App nativo, sem WebView. O windows-rs fala direto com registro, serviços, SystemParametersInfo, ChangeDisplaySettingsEx e WMI. Não abre PowerShell para isso.";
-                            color: #c5ccd6;
-                            wrap: word-wrap;
-                        }
-                        Text {
-                            text: "O backup fica em %LOCALAPPDATA%\\TurboApp\\backup.json, o histórico em log.jsonl e o registro de cada leitura em turbo.log. Atualizar ou desinstalar o programa não apaga esses arquivos.";
-                            color: #c5ccd6;
-                            wrap: word-wrap;
-                        }
-                        Text {
-                            text: "Roteamento estilo ExitLag é um serviço pago de servidores, não um ajuste local. O Turbo só mostra a placa e o cabo.";
-                            color: #c5ccd6;
-                            wrap: word-wrap;
+                        Rectangle {
+                            height: 280px;
+                            vertical-stretch: 0;
+                            VerticalLayout {
+                                alignment: start;
+                                spacing: 10px;
+                                Text { text: "Turbo " + root.version-label; color: #f4f7fb; font-size: 26px; font-weight: 700; vertical-stretch: 0; }
+                                Text { text: "Made with Slint"; color: #ffb199; font-weight: 700; vertical-stretch: 0; }
+                                Text {
+                                    text: "App nativo, sem WebView. O windows-rs fala direto com registro, serviços, SystemParametersInfo, ChangeDisplaySettingsEx e WMI. Não abre PowerShell para isso.";
+                                    color: #c5ccd6;
+                                    font-size: 13px;
+                                    wrap: word-wrap;
+                                    vertical-stretch: 0;
+                                }
+                                Text {
+                                    text: "O backup fica em %LOCALAPPDATA%\\TurboApp\\backup.json, o histórico em log.jsonl e o registro de cada leitura em turbo.log. Atualizar ou desinstalar o programa não apaga esses arquivos.";
+                                    color: #c5ccd6;
+                                    font-size: 13px;
+                                    wrap: word-wrap;
+                                    vertical-stretch: 0;
+                                }
+                                Text {
+                                    text: "Roteamento estilo ExitLag é um serviço pago de servidores, não um ajuste local. O Turbo só mostra a placa e o cabo.";
+                                    color: #c5ccd6;
+                                    font-size: 13px;
+                                    wrap: word-wrap;
+                                    vertical-stretch: 0;
+                                }
+                            }
                         }
                     }
                 }
             }
-            if root.toast != "": Rectangle {
-                min-height: 36px;
+        }
+    }
+    }
+
+    if root.toast != "": VerticalLayout {
+        alignment: end;
+        padding: 24px;
+        HorizontalLayout {
+            alignment: end;
+            Rectangle {
+                width: 360px;
+                height: 76px;
+                vertical-stretch: 0;
+                horizontal-stretch: 0;
+                border-radius: 12px;
                 background: #1c2027;
+                border-width: 1px;
+                border-color: root.toast-kind == "bad" ? #e85d4c : root.toast-kind == "ok" ? #3ddc97 : #3c4654;
                 VerticalLayout {
-                    padding: 8px;
-                    padding-left: 16px;
-                    padding-right: 16px;
-                    Text {
-                        text: root.toast;
-                        color: #f0d7a0;
-                        font-size: 12px;
-                        wrap: word-wrap;
-                        vertical-stretch: 0;
-                    }
+                    alignment: start;
+                    padding: 12px;
+                    spacing: 4px;
+                    Text { text: root.toast-kind == "bad" ? "Não deu certo" : "Turbo"; color: #9aa3af; font-size: 11px; font-weight: 700; vertical-stretch: 0; }
+                    Text { text: root.toast; color: #f4f7fb; font-size: 13px; wrap: word-wrap; vertical-stretch: 0; }
                 }
             }
         }
     }
 
     if root.dialog-open: Rectangle {
-        background: #000000aa;
+        background: #000000cc;
         TouchArea {}
-        Rectangle {
-            width: 520px;
-            x: (parent.width - self.width) / 2;
-            y: (parent.height - self.height) / 2;
-            background: #1c2027;
-            border-radius: 16px;
-            border-width: 1px;
-            border-color: #3c4654;
-            VerticalLayout {
-                padding: 20px;
-                spacing: 12px;
-                Text { text: root.dialog-title; color: #f4f7fb; font-size: 18px; font-weight: 700; wrap: word-wrap; }
-                Text { text: root.dialog-body; color: #d5dbe3; wrap: word-wrap; }
-                HorizontalLayout {
-                    spacing: 8px;
-                    alignment: end;
-                    if root.dialog-secondary-visible: Btn { label: root.dialog-secondary; clicked => { root.cancel-dialog(); } }
-                    Btn { label: root.dialog-primary; primary: true; clicked => { root.accept-dialog(); } }
+        VerticalLayout {
+            alignment: center;
+            HorizontalLayout {
+                alignment: center;
+                Rectangle {
+                    width: 520px;
+                    height: 280px;
+                    vertical-stretch: 0;
+                    horizontal-stretch: 0;
+                    background: #1c2027;
+                    border-radius: 12px;
+                    border-width: 1px;
+                    border-color: #3c4654;
+                    TouchArea {}
+                    VerticalLayout {
+                        alignment: start;
+                        padding: 20px;
+                        spacing: 12px;
+                        Text { text: root.dialog-title; color: #f4f7fb; font-size: 18px; font-weight: 700; wrap: word-wrap; vertical-stretch: 0; }
+                        ScrollView {
+                            vertical-stretch: 0;
+                            max-height: 240px;
+                            VerticalLayout {
+                                alignment: start;
+                                Text {
+                                    text: root.dialog-body;
+                                    color: #d5dbe3;
+                                    font-size: 13px;
+                                    wrap: word-wrap;
+                                    width: 480px;
+                                    vertical-stretch: 0;
+                                }
+                            }
+                        }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            alignment: end;
+                            vertical-stretch: 0;
+                            if root.dialog-secondary-visible: Btn { label: root.dialog-secondary; clicked => { root.cancel-dialog(); } }
+                            if root.dialog-alt-visible: Btn { label: root.dialog-alt; clicked => { root.alt-dialog(); } }
+                            Btn { label: root.dialog-primary; primary: true; clicked => { root.accept-dialog(); } }
+                        }
+                    }
                 }
             }
         }
     }
 
     if root.update-open: Rectangle {
-        background: #000000aa;
+        background: #000000cc;
         TouchArea {}
-        Rectangle {
-            width: 560px;
-            x: (parent.width - self.width) / 2;
-            y: 80px;
-            background: #1c2027;
-            border-radius: 16px;
-            border-width: 1px;
-            border-color: #ff5a36;
-            VerticalLayout {
-                padding: 20px;
-                spacing: 12px;
-                Text { text: root.update-title; color: #f4f7fb; font-size: 18px; font-weight: 700; wrap: word-wrap; }
-                Text { text: root.update-body; color: #d5dbe3; wrap: word-wrap; }
-                Text { text: "O arquivo só é instalado se o SHA-256 e a assinatura baterem. Backup e log ficam na sua pasta."; color: #9aa3af; font-size: 12px; wrap: word-wrap; }
-                HorizontalLayout {
-                    spacing: 8px;
-                    alignment: end;
-                    Btn { label: "Agora não"; clicked => { root.update-later(); } }
-                    Btn { label: "Baixar e instalar"; primary: true; clicked => { root.update-accept(); } }
+        VerticalLayout {
+            alignment: center;
+            HorizontalLayout {
+                alignment: center;
+                Rectangle {
+                    width: 520px;
+                    height: 280px;
+                    vertical-stretch: 0;
+                    horizontal-stretch: 0;
+                    background: #1c2027;
+                    border-radius: 12px;
+                    border-width: 1px;
+                    border-color: #ff5a36;
+                    TouchArea {}
+                    VerticalLayout {
+                        alignment: start;
+                        padding: 20px;
+                        spacing: 12px;
+                        Text { text: root.update-title; color: #f4f7fb; font-size: 18px; font-weight: 700; wrap: word-wrap; vertical-stretch: 0; }
+                        ScrollView {
+                            vertical-stretch: 0;
+                            max-height: 240px;
+                            VerticalLayout {
+                                alignment: start;
+                                Text {
+                                    text: root.update-body;
+                                    color: #d5dbe3;
+                                    font-size: 13px;
+                                    wrap: word-wrap;
+                                    width: 480px;
+                                    vertical-stretch: 0;
+                                }
+                            }
+                        }
+                        Text { text: "O arquivo só é instalado se o SHA-256 e a assinatura baterem. Backup e log ficam na sua pasta."; color: #9aa3af; font-size: 12px; wrap: word-wrap; vertical-stretch: 0; }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            alignment: end;
+                            vertical-stretch: 0;
+                            Btn { label: "Agora não"; clicked => { root.update-later(); } }
+                            Btn { label: "Baixar e instalar"; primary: true; clicked => { root.update-accept(); } }
+                        }
+                    }
                 }
             }
         }

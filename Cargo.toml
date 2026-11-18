@@ -1,6 +1,6 @@
 [package]
 name = "turbo-app"
-version = "1.0.2"
+version = "1.1.0"
 edition = "2021"
 description = "Otimização segura e reversível do Windows 11 para Valorant e League of Legends"
 publish = false
