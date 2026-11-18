@@ -32,6 +32,8 @@ pub struct FakeBackend {
     startup: Vec<StartupEntry>,
     security: SecurityStatus,
     pub protection_enabled: bool,
+    pub restore_frequency: Duration,
+    pub fail_adapters: Option<String>,
     restore_points: Vec<(RestorePointInfo, SystemTime)>,
     pub elevated: bool,
     pub fail_writes: bool,
@@ -94,6 +96,8 @@ impl FakeBackend {
                 spec_version: "2.0, 0, 1.38".into(),
             },
             protection_enabled: true,
+            restore_frequency: Duration::from_secs(24 * 3600),
+            fail_adapters: None,
             restore_points: vec![],
             elevated: true,
             fail_writes: false,
@@ -445,6 +449,9 @@ impl SystemBackend for FakeBackend {
     }
 
     fn adapters(&self) -> Result<Vec<AdapterInfo>, BackendError> {
+        if let Some(reason) = &self.fail_adapters {
+            return Err(BackendError::Failed(reason.clone()));
+        }
         Ok(self.adapters.clone())
     }
 
@@ -480,17 +487,29 @@ impl SystemBackend for FakeBackend {
         Ok(self.protection_enabled)
     }
 
+    fn set_system_protection(&mut self, enabled: bool) -> Result<(), BackendError> {
+        self.protection_enabled = enabled;
+        Ok(())
+    }
+
     fn recent_restore_point(&self) -> Result<Option<RestorePointInfo>, BackendError> {
+        if self.restore_frequency.is_zero() {
+            return Ok(None);
+        }
         let now = self.clock();
         let mut best: Option<(RestorePointInfo, SystemTime)> = None;
         for (info, when) in &self.restore_points {
-            if now.duration_since(*when).unwrap_or(Duration::ZERO) <= Duration::from_secs(24 * 3600) {
+            if now.duration_since(*when).unwrap_or(Duration::ZERO) <= self.restore_frequency {
                 if best.as_ref().map(|(_, t)| when > t).unwrap_or(true) {
                     best = Some((info.clone(), *when));
                 }
             }
         }
         Ok(best.map(|(info, _)| info))
+    }
+
+    fn restore_point_visible(&self, sequence: i64) -> Result<bool, BackendError> {
+        Ok(self.restore_points.iter().any(|(info, _)| info.sequence == sequence))
     }
 
     fn create_restore_point(&mut self, description: &str) -> Result<RestorePointInfo, BackendError> {

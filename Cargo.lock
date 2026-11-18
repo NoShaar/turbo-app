@@ -4541,7 +4541,7 @@ dependencies = [
 
 [[package]]
 name = "turbo-app"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "chrono",
  "ed25519-dalek",

@@ -14,7 +14,7 @@ Para ter o ponto também: Painel de Controle > Sistema > Proteção do Sistema >
 Sem o ponto, a reversão do Turbo continua valendo para o que ele mesmo alterou.";
 
 pub const RESTORE_24H_NOTE: &str = "\
-O Windows só cria 1 ponto de restauração a cada 24 horas. Já existe um de hoje; o Turbo usa esse e guarda os valores originais no JSON.";
+O Windows só cria 1 ponto de restauração a cada 24 horas (SystemRestorePointCreationFrequency). Já existe um dentro desse prazo; o Turbo usa esse e guarda os valores originais no JSON.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApplyOutcome {
@@ -30,7 +30,9 @@ pub struct OptimizePlan {
 }
 
 pub fn create_backup(sys: &mut dyn SystemBackend, ack_no_protection: bool) -> Result<BackupFile, EngineError> {
+    crate::store::trace(&format!("ação backup início ack_sem_proteção={ack_no_protection}"));
     let restore_point = decide_restore_point(sys, ack_no_protection)?;
+    crate::store::trace(&format!("ação backup ponto {:?} seq {:?} — {}", restore_point.status, restore_point.sequence, restore_point.message));
     let mut items = Vec::new();
     for item in catalog::ITEMS.iter().filter(|i| !i.readonly) {
         let snapshot = tweaks::capture(item.id, sys)?;
@@ -56,6 +58,7 @@ fn decide_restore_point(sys: &mut dyn SystemBackend, ack_no_protection: bool) ->
             message: PROTECTION_OFF_MESSAGE.to_string(),
             sequence: None,
             acknowledged_no_protection: true,
+            protection_enabled_by_app: false,
         });
     }
     if let Some(existing) = sys.recent_restore_point()? {
@@ -64,15 +67,11 @@ fn decide_restore_point(sys: &mut dyn SystemBackend, ack_no_protection: bool) ->
             message: format!("{RESTORE_24H_NOTE} Ponto: {} ({}).", existing.description, existing.sequence),
             sequence: Some(existing.sequence),
             acknowledged_no_protection: false,
+            protection_enabled_by_app: false,
         });
     }
     match sys.create_restore_point("Turbo App") {
-        Ok(info) => Ok(RestorePointRecord {
-            status: RestorePointStatus::Created,
-            message: format!("Ponto de restauração criado: {} ({}).", info.description, info.sequence),
-            sequence: Some(info.sequence),
-            acknowledged_no_protection: false,
-        }),
+        Ok(info) => confirm_created_point(sys, info),
         Err(BackendError::Failed(msg)) if msg.contains("PROTECTION_DISABLED") => {
             if !ack_no_protection {
                 return Err(EngineError::ProtectionDisabled { message: PROTECTION_OFF_MESSAGE.to_string() });
@@ -82,6 +81,7 @@ fn decide_restore_point(sys: &mut dyn SystemBackend, ack_no_protection: bool) ->
                 message: PROTECTION_OFF_MESSAGE.to_string(),
                 sequence: None,
                 acknowledged_no_protection: true,
+                protection_enabled_by_app: false,
             })
         }
         Err(BackendError::Failed(msg)) if msg.contains("RESTORE_POINT_24H") => {
@@ -91,6 +91,7 @@ fn decide_restore_point(sys: &mut dyn SystemBackend, ack_no_protection: bool) ->
                 message: RESTORE_24H_NOTE.to_string(),
                 sequence: existing.map(|e| e.sequence),
                 acknowledged_no_protection: false,
+                protection_enabled_by_app: false,
             })
         }
         Err(err) => Ok(RestorePointRecord {
@@ -98,6 +99,33 @@ fn decide_restore_point(sys: &mut dyn SystemBackend, ack_no_protection: bool) ->
             message: format!("Não foi possível criar o ponto de restauração ({err}). O JSON com os valores originais foi salvo mesmo assim."),
             sequence: None,
             acknowledged_no_protection: false,
+            protection_enabled_by_app: false,
+        }),
+    }
+}
+
+fn confirm_created_point(sys: &mut dyn SystemBackend, info: RestorePointInfo) -> Result<RestorePointRecord, EngineError> {
+    match sys.restore_point_visible(info.sequence) {
+        Ok(true) => Ok(RestorePointRecord {
+            status: RestorePointStatus::Created,
+            message: format!("Ponto de restauração confirmado na leitura: {} ({}).", info.description, info.sequence),
+            sequence: Some(info.sequence),
+            acknowledged_no_protection: false,
+            protection_enabled_by_app: false,
+        }),
+        Ok(false) => Ok(RestorePointRecord {
+            status: RestorePointStatus::Failed,
+            message: "O Windows aceitou criar o ponto, mas a leitura seguinte não encontrou esse número. O JSON foi salvo mesmo assim.".into(),
+            sequence: Some(info.sequence),
+            acknowledged_no_protection: false,
+            protection_enabled_by_app: false,
+        }),
+        Err(err) => Ok(RestorePointRecord {
+            status: RestorePointStatus::Failed,
+            message: format!("O ponto foi pedido, mas a leitura de confirmação falhou ({err}). O JSON foi salvo mesmo assim."),
+            sequence: Some(info.sequence),
+            acknowledged_no_protection: false,
+            protection_enabled_by_app: false,
         }),
     }
 }
@@ -105,9 +133,41 @@ fn decide_restore_point(sys: &mut dyn SystemBackend, ack_no_protection: bool) ->
 pub fn diagnose_all(sys: &dyn SystemBackend, ctx: &ReadCache<'_>, backup: Option<&BackupFile>) -> Result<Vec<ItemView>, EngineError> {
     let mut views = Vec::with_capacity(catalog::ITEMS.len());
     for item in catalog::ITEMS {
-        views.push(view_one(sys, ctx, backup, item.id)?);
+        match view_one(sys, ctx, backup, item.id) {
+            Ok(view) => {
+                crate::store::trace(&format!("leitura {} ({}) {}", item.id, item.name, view.state.label()));
+                views.push(view);
+            }
+            Err(err) => {
+                let detail = format!("Falha ao ler {}: {err}", item.name);
+                crate::store::trace(&format!("leitura {} ({}) {detail}", item.id, item.name));
+                views.push(unread_view(item, detail));
+            }
+        }
     }
     Ok(views)
+}
+
+fn unread_view(item: &catalog::ItemMeta, detail: String) -> ItemView {
+    ItemView {
+        id: item.id.to_string(),
+        section: item.section,
+        name: item.name.to_string(),
+        faz: item.faz.to_string(),
+        ajuda: item.ajuda.to_string(),
+        ok_when: item.ok_when.to_string(),
+        admin: item.admin.to_string(),
+        reinicio: item.reinicio.to_string(),
+        seal: item.seal,
+        caveat: item.caveat.unwrap_or("").to_string(),
+        readonly: item.readonly,
+        conditional: item.conditional,
+        state: ItemState::NotRead,
+        detail,
+        can_optimize: false,
+        can_revert: false,
+        needs_admin_read: false,
+    }
 }
 
 pub fn view_one(sys: &dyn SystemBackend, ctx: &ReadCache<'_>, backup: Option<&BackupFile>, id: &str) -> Result<ItemView, EngineError> {
@@ -340,6 +400,7 @@ mod tests {
                 message: String::new(),
                 sequence: None,
                 acknowledged_no_protection: false,
+                protection_enabled_by_app: false,
             },
             items: vec![],
         }, "p-dvr", None).unwrap_err();
@@ -433,6 +494,43 @@ mod tests {
         sys.add_restore_point_at("antigo", now - Duration::from_secs(25 * 3600));
         let backup = create_backup(&mut sys, false).unwrap();
         assert_eq!(backup.restore_point.status, RestorePointStatus::Created);
+    }
+
+    #[test]
+    fn one_failed_read_does_not_drop_the_rest() {
+        let mut sys = ready();
+        sys.fail_adapters = Some("consulta WMI inválida para essa classe (0x80041017)".into());
+        let views = diagnose_all(&sys, &ReadCache::empty(), None).unwrap();
+        assert_eq!(views.len(), catalog::ITEMS.len());
+        let link = views.iter().find(|v| v.id == "n-link").unwrap();
+        assert_eq!(link.state, ItemState::NotRead);
+        assert!(link.detail.contains("Falha ao ler"));
+        assert!(link.detail.contains("0x80041017"));
+        let mouse = views.iter().find(|v| v.id == "m-vel").unwrap();
+        assert_eq!(mouse.state, ItemState::Ok);
+        let read = views.iter().filter(|v| v.state == ItemState::Ok || v.state == ItemState::CanImprove).count();
+        assert!(read > 5, "leituras que funcionam precisam aparecer nos contadores, vieram {read}");
+    }
+
+    #[test]
+    fn zero_frequency_does_not_reuse_a_recent_point() {
+        let mut sys = ready();
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        sys.now = Some(now);
+        sys.restore_frequency = Duration::from_secs(0);
+        sys.add_restore_point_at("recente", now - Duration::from_secs(60));
+        let backup = create_backup(&mut sys, false).unwrap();
+        assert_eq!(backup.restore_point.status, RestorePointStatus::Created);
+    }
+
+    #[test]
+    fn enabling_protection_then_backup_creates_a_point() {
+        let mut sys = ready();
+        sys.protection_enabled = false;
+        sys.set_system_protection(true).unwrap();
+        let backup = create_backup(&mut sys, false).unwrap();
+        assert_eq!(backup.restore_point.status, RestorePointStatus::Created);
+        assert!(backup.restore_point.message.contains("confirmado"));
     }
 
     #[test]

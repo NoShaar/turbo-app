@@ -352,8 +352,16 @@ impl SystemBackend for WindowsBackend {
         }
     }
 
+    fn set_system_protection(&mut self, enabled: bool) -> Result<(), BackendError> {
+        set_system_protection(self, enabled)
+    }
+
     fn recent_restore_point(&self) -> Result<Option<RestorePointInfo>, BackendError> {
         recent_restore(self)
+    }
+
+    fn restore_point_visible(&self, sequence: i64) -> Result<bool, BackendError> {
+        Ok(list_restore_points(self)?.iter().any(|info| info.sequence == sequence))
     }
 
     fn create_restore_point(&mut self, description: &str) -> Result<RestorePointInfo, BackendError> {
@@ -405,12 +413,52 @@ fn win_ok(err: WIN32_ERROR, what: &str) -> Result<(), BackendError> {
 }
 
 fn wmi_err(err: wmi::WMIError) -> BackendError {
-    let msg = err.to_string();
-    let lower = msg.to_ascii_lowercase();
-    if lower.contains("access") || lower.contains("privilege") || msg.contains("80041003") || msg.contains("80070005") {
-        BackendError::AccessDenied(msg)
+    let raw = err.to_string();
+    let code = hresult_code(&raw);
+    let pt = match code {
+        Some(0x80041017) => "consulta WMI inválida para essa classe (0x80041017)".to_string(),
+        Some(0x80041003) => "acesso negado pelo WMI (0x80041003)".to_string(),
+        Some(0x80041002) => "objeto WMI não encontrado (0x80041002)".to_string(),
+        Some(0x80041010) => "classe WMI inexistente neste Windows (0x80041010)".to_string(),
+        Some(0x80070005) => "acesso negado (0x80070005)".to_string(),
+        Some(code) => format!("falha do Windows 0x{code:08X}"),
+        None => raw.replace("HRESULT Call failed with: ", "falha do Windows: "),
+    };
+    let denied = matches!(code, Some(0x80041003) | Some(0x80070005))
+        || raw.to_ascii_lowercase().contains("access")
+        || raw.to_ascii_lowercase().contains("privilege");
+    if denied {
+        BackendError::AccessDenied(pt)
     } else {
-        BackendError::Failed(msg)
+        BackendError::Failed(pt)
+    }
+}
+
+fn hresult_code(text: &str) -> Option<u32> {
+    let lower = text.to_ascii_lowercase();
+    let at = lower.find("0x")?;
+    let hex: String = lower[at + 2..].chars().take_while(|c| c.is_ascii_hexdigit()).collect();
+    u32::from_str_radix(&hex, 16).ok()
+}
+
+fn wmi_query<T: serde::de::DeserializeOwned>(backend: &WindowsBackend, namespace: &str, what: &str, query: &str) -> Result<Vec<T>, BackendError> {
+    let wmi = match backend.wmi(namespace) {
+        Ok(wmi) => wmi,
+        Err(err) => {
+            crate::store::trace(&format!("wmi {what} namespace={namespace} conexão falhou: {err}"));
+            return Err(err);
+        }
+    };
+    match wmi.raw_query(query) {
+        Ok(rows) => {
+            crate::store::trace(&format!("wmi ok {what} {namespace} :: {query}"));
+            Ok(rows)
+        }
+        Err(err) => {
+            let mapped = wmi_err(err);
+            crate::store::trace(&format!("wmi falha {what} {namespace} :: {query} :: {mapped}"));
+            Err(mapped)
+        }
     }
 }
 
@@ -617,9 +665,14 @@ fn read_disks(backend: &WindowsBackend) -> Result<Vec<DiskHealth>, BackendError>
         ReadErrorsUncorrected: Option<u64>,
         WriteErrorsUncorrected: Option<u64>,
     }
-    let wmi = backend.wmi(r"root\Microsoft\Windows\Storage")?;
-    let disks: Vec<DiskRow> = wmi.raw_query("SELECT FriendlyName, MediaType, BusType, HealthStatus, DeviceId FROM MSFT_PhysicalDisk").map_err(wmi_err)?;
-    let counters: Vec<CounterRow> = wmi.raw_query("SELECT DeviceId, Temperature, TemperatureMax, Wear, PowerOnHours, ReadErrorsUncorrected, WriteErrorsUncorrected FROM MSFT_StorageReliabilityCounter").unwrap_or_default();
+    let disks: Vec<DiskRow> = wmi_query(backend, r"root\Microsoft\Windows\Storage", "discos físicos", "SELECT FriendlyName, MediaType, BusType, HealthStatus, DeviceId FROM MSFT_PhysicalDisk")?;
+    let counters: Vec<CounterRow> = wmi_query(
+        backend,
+        r"root\Microsoft\Windows\Storage",
+        "contadores SMART",
+        "SELECT DeviceId, Temperature, TemperatureMax, Wear, PowerOnHours, ReadErrorsUncorrected, WriteErrorsUncorrected FROM MSFT_StorageReliabilityCounter",
+    )
+    .unwrap_or_default();
     let mut by_id: BTreeMap<String, &CounterRow> = BTreeMap::new();
     for counter in &counters {
         if let Some(id) = &counter.DeviceId {
@@ -907,12 +960,11 @@ fn read_location(backend: &WindowsBackend) -> Result<WindowsLocation, BackendErr
         Some(RegValue::Sz(line)) => parse_pagefile(&line),
         _ => (format!(r"{system_drive}\pagefile.sys"), 0),
     };
-    let wmi = backend.wmi("root\\cimv2")?;
     #[derive(Deserialize)]
     struct Link { Antecedent: Option<String>, Dependent: Option<String> }
     #[derive(Deserialize)]
     struct Page { Name: Option<String>, AllocatedBaseSize: Option<u64> }
-    let links: Vec<Link> = wmi.raw_query("SELECT Antecedent, Dependent FROM Win32_LogicalDiskToPartition").map_err(wmi_err)?;
+    let links: Vec<Link> = wmi_query(backend, r"root\cimv2", "disco do Windows", "SELECT Antecedent, Dependent FROM Win32_LogicalDiskToPartition")?;
     let mut letter_disk: BTreeMap<String, u32> = BTreeMap::new();
     for link in links {
         let Some(dep) = link.Dependent else { continue };
@@ -921,7 +973,7 @@ fn read_location(backend: &WindowsBackend) -> Result<WindowsLocation, BackendErr
             letter_disk.insert(letter.to_ascii_uppercase(), index);
         }
     }
-    let usage: Vec<Page> = wmi.raw_query("SELECT Name, AllocatedBaseSize FROM Win32_PageFileUsage").unwrap_or_default();
+    let usage: Vec<Page> = wmi_query(backend, r"root\cimv2", "arquivo de paginação", "SELECT Name, AllocatedBaseSize FROM Win32_PageFileUsage").unwrap_or_default();
     let page_mb = usage.first().and_then(|p| p.AllocatedBaseSize).unwrap_or(page_mb);
     let page_path = usage.first().and_then(|p| p.Name.clone()).unwrap_or(page_path);
     let media = disk_media_by_index(backend);
@@ -960,17 +1012,25 @@ fn disk_index(text: &str) -> Option<u32> {
 }
 
 fn read_adapters(backend: &WindowsBackend) -> Result<Vec<AdapterInfo>, BackendError> {
+    // MSFT_NetAdapter não tem LinkSpeed. Essa propriedade é do PowerShell.
+    // No CIM existem Speed, ReceiveLinkSpeed e TransmitLinkSpeed.
     #[derive(Deserialize)]
     struct Row {
         Name: Option<String>,
-        NdisPhysicalMedium: Option<u32>,
-        LinkSpeed: Option<u64>,
-        HardwareInterface: Option<bool>,
-        MediaConnectState: Option<u16>,
         InterfaceDescription: Option<String>,
+        NdisPhysicalMedium: Option<u32>,
+        HardwareInterface: Option<bool>,
+        MediaConnectState: Option<u32>,
+        Speed: Option<u64>,
+        ReceiveLinkSpeed: Option<u64>,
+        TransmitLinkSpeed: Option<u64>,
     }
-    let wmi = backend.wmi(r"root\StandardCimv2")?;
-    let rows: Vec<Row> = wmi.raw_query("SELECT Name, NdisPhysicalMedium, LinkSpeed, HardwareInterface, MediaConnectState, InterfaceDescription FROM MSFT_NetAdapter").map_err(wmi_err)?;
+    let rows: Vec<Row> = wmi_query(
+        backend,
+        r"root\StandardCimv2",
+        "placas de rede",
+        "SELECT Name, InterfaceDescription, NdisPhysicalMedium, HardwareInterface, MediaConnectState, Speed, ReceiveLinkSpeed, TransmitLinkSpeed FROM MSFT_NetAdapter",
+    )?;
     let mut out = Vec::new();
     for row in rows {
         if row.HardwareInterface == Some(false) {
@@ -985,9 +1045,8 @@ fn read_adapters(backend: &WindowsBackend) -> Result<Vec<AdapterInfo>, BackendEr
         let wired = medium == 14 || (!desc.contains("wi-fi") && !desc.contains("wireless") && !desc.contains("wlan") && medium != 9);
         let connected = row.MediaConnectState == Some(1);
         let props = nic_props(backend, &name);
-        let max_bps = props.iter().find_map(|p| p.display_name.contains("Speed").then_some(0)).unwrap_or(0);
-        let link = row.LinkSpeed.unwrap_or(0);
-        let max_bps = if max_bps == 0 { link.max(guess_max(link, wired)) } else { max_bps };
+        let link = row.ReceiveLinkSpeed.unwrap_or(0).max(row.TransmitLinkSpeed.unwrap_or(0)).max(row.Speed.unwrap_or(0));
+        let max_bps = link.max(guess_max(link, wired));
         out.push(AdapterInfo { name, wired, connected, link_bps: link, max_bps, power_props: props });
     }
     Ok(out)
@@ -1001,7 +1060,10 @@ fn guess_max(link: u64, wired: bool) -> u64 {
 }
 
 fn nic_props(backend: &WindowsBackend, adapter: &str) -> Vec<NicPowerProp> {
-    let Ok(wmi) = backend.wmi(r"root\StandardCimv2") else { return registry_nic_props(backend, adapter); };
+    let safe: String = adapter.chars().filter(|c| *c != '\'' && *c != ';' && *c != '"').collect();
+    if safe.is_empty() {
+        return registry_nic_props(backend, adapter);
+    }
     #[derive(Deserialize, Default)]
     struct Prop {
         Name: Option<String>,
@@ -1012,8 +1074,8 @@ fn nic_props(backend: &WindowsBackend, adapter: &str) -> Vec<NicPowerProp> {
         ValidDisplayValues: Option<Vec<String>>,
         ValidRegistryValues: Option<Vec<String>>,
     }
-    let query = format!("SELECT Name, DisplayName, RegistryKeyword, DisplayValue, RegistryValue, ValidDisplayValues, ValidRegistryValues FROM MSFT_NetAdapterAdvancedPropertySettingData WHERE Name = '{adapter}'");
-    let rows: Vec<Prop> = match wmi.raw_query(&query) {
+    let query = format!("SELECT Name, DisplayName, RegistryKeyword, DisplayValue, RegistryValue, ValidDisplayValues, ValidRegistryValues FROM MSFT_NetAdapterAdvancedPropertySettingData WHERE Name = '{safe}'");
+    let rows: Vec<Prop> = match wmi_query(backend, r"root\StandardCimv2", "propriedades da placa", &query) {
         Ok(rows) => rows,
         Err(_) => return registry_nic_props(backend, adapter),
     };
@@ -1140,9 +1202,9 @@ fn bounce_adapter(backend: &WindowsBackend, adapter: &str) {
 #[derive(Deserialize)]
 #[allow(non_camel_case_types)]
 struct MSFT_NetAdapter {}
-    let Ok(wmi) = backend.wmi(r"root\StandardCimv2") else { return };
-    let Ok(rows): Result<Vec<AdapterRow>, _> = wmi.raw_query("SELECT Name, __Path FROM MSFT_NetAdapter").map_err(wmi_err) else { return };
+    let Ok(rows) = wmi_query::<AdapterRow>(backend, r"root\StandardCimv2", "religar placa", "SELECT Name, __Path FROM MSFT_NetAdapter") else { return };
     let Some(path) = rows.into_iter().find(|r| r.Name.as_deref().unwrap_or("").eq_ignore_ascii_case(adapter)).and_then(|r| r.__Path) else { return };
+    let Ok(wmi) = backend.wmi(r"root\StandardCimv2") else { return };
     let _ = wmi.exec_instance_method::<MSFT_NetAdapter, _, Ret>("Disable", &path, ());
     thread::sleep(Duration::from_millis(400));
     let _ = wmi.exec_instance_method::<MSFT_NetAdapter, _, Ret>("Enable", &path, ());
@@ -1262,8 +1324,7 @@ fn read_security(backend: &WindowsBackend) -> Result<SecurityStatus, BackendErro
     }
     #[derive(Deserialize)]
     struct Tpm { SpecVersion: Option<String>, IsEnabled_InitialValue: Option<bool>, IsActivated_InitialValue: Option<bool> }
-    let wmi = backend.wmi(r"root\cimv2\Security\MicrosoftTpm")?;
-    let rows: Vec<Tpm> = wmi.raw_query("SELECT SpecVersion, IsEnabled_InitialValue, IsActivated_InitialValue FROM Win32_Tpm").map_err(wmi_err)?;
+    let rows: Vec<Tpm> = wmi_query(backend, r"root\cimv2\Security\MicrosoftTpm", "TPM", "SELECT SpecVersion, IsEnabled_InitialValue, IsActivated_InitialValue FROM Win32_Tpm")?;
     let row = rows.into_iter().next();
     Ok(SecurityStatus {
         secure_boot: secure,
@@ -1290,35 +1351,48 @@ fn enable_firmware_privilege() {
     }
 }
 
-fn recent_restore(backend: &WindowsBackend) -> Result<Option<RestorePointInfo>, BackendError> {
+fn restore_frequency(backend: &WindowsBackend) -> Duration {
+    match backend.reg_get(Hive::Hklm, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore", "SystemRestorePointCreationFrequency") {
+        Ok(Some(RegValue::Dword(0))) => Duration::from_secs(0),
+        Ok(Some(RegValue::Dword(secs))) => Duration::from_secs(secs as u64),
+        _ => Duration::from_secs(24 * 3600),
+    }
+}
+
+fn list_restore_points(backend: &WindowsBackend) -> Result<Vec<RestorePointInfo>, BackendError> {
     #[derive(Deserialize)]
     struct Row { SequenceNumber: Option<u32>, Description: Option<String>, CreationTime: Option<String> }
-    let wmi = match backend.wmi(r"root\default") {
-        Ok(w) => w,
-        Err(BackendError::AccessDenied(_)) => return Ok(None),
-        Err(err) => return Err(err),
-    };
-    let rows: Vec<Row> = match wmi.raw_query("SELECT SequenceNumber, Description, CreationTime FROM SystemRestore") {
-        Ok(rows) => rows,
-        Err(_) => return Ok(None),
-    };
-    let mut best: Option<RestorePointInfo> = None;
+    let rows: Vec<Row> = wmi_query(backend, r"root\default", "pontos de restauração", "SELECT SequenceNumber, Description, CreationTime FROM SystemRestore")?;
+    let mut out = Vec::new();
     for row in rows {
-        let Some(when) = row.CreationTime.as_deref().and_then(parse_wmi_time) else { continue };
-        let age = chrono::Utc::now().signed_duration_since(when);
-        if age.num_hours() > 24 || age.num_hours() < 0 {
-            continue;
-        }
-        let info = RestorePointInfo {
+        let when = row.CreationTime.as_deref().and_then(parse_wmi_time);
+        out.push(RestorePointInfo {
             sequence: row.SequenceNumber.unwrap_or(0) as i64,
             description: row.Description.unwrap_or_else(|| "Ponto de restauração".into()),
-            created_rfc3339: when.to_rfc3339(),
-        };
-        if best.as_ref().map(|b| info.sequence > b.sequence).unwrap_or(true) {
-            best = Some(info);
+            created_rfc3339: when.map(|t| t.to_rfc3339()).unwrap_or_default(),
+        });
+    }
+    Ok(out)
+}
+
+fn recent_restore(backend: &WindowsBackend) -> Result<Option<RestorePointInfo>, BackendError> {
+    let window = restore_frequency(backend);
+    if window.is_zero() {
+        crate::store::trace("ponto de restauração: SystemRestorePointCreationFrequency=0, sem reaproveitar ponto antigo");
+        return Ok(None);
+    }
+    let mut best: Option<(RestorePointInfo, chrono::DateTime<chrono::Utc>)> = None;
+    for info in list_restore_points(backend)? {
+        let Some(when) = chrono::DateTime::parse_from_rfc3339(&info.created_rfc3339).ok().map(|t| t.with_timezone(&chrono::Utc)) else { continue };
+        let age = chrono::Utc::now().signed_duration_since(when);
+        if age.num_seconds() > window.as_secs() as i64 || age.num_seconds() < 0 {
+            continue;
+        }
+        if best.as_ref().map(|(_, t)| when > *t).unwrap_or(true) {
+            best = Some((info, when));
         }
     }
-    Ok(best)
+    Ok(best.map(|(info, _)| info))
 }
 
 #[cfg(test)]
@@ -1348,6 +1422,45 @@ fn parse_wmi_time(text: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     chrono::NaiveDate::from_ymd_opt(year, month, day)?.and_hms_opt(hour, min, sec).map(|n| n.and_utc())
 }
 
+fn set_system_protection(backend: &mut WindowsBackend, enabled: bool) -> Result<(), BackendError> {
+    #[derive(Deserialize)]
+    #[allow(non_camel_case_types)]
+    struct SystemRestore {}
+    #[derive(serde::Serialize)]
+    struct DriveArg {
+        Drive: String,
+    }
+    #[derive(Deserialize)]
+    struct Ret {
+        ReturnValue: Option<u32>,
+    }
+    let drive = windows_drive();
+    let method = if enabled { "Enable" } else { "Disable" };
+    crate::store::trace(&format!("ação proteção do sistema {method} {drive}"));
+    let wmi = backend.wmi(r"root\default")?;
+    let out: Ret = wmi.exec_class_method::<SystemRestore, _, _>(method, DriveArg { Drive: drive.clone() }).map_err(wmi_err)?;
+    let code = out.ReturnValue.unwrap_or(0);
+    crate::store::trace(&format!("ação proteção {method} ReturnValue={code}"));
+    if code != 0 {
+        let verb = if enabled { "ligar" } else { "desligar" };
+        return Err(BackendError::Failed(format!("não consegui {verb} a Proteção do Sistema em {drive} (código {code})")));
+    }
+    let flag = if enabled { 0 } else { 1 };
+    let _ = backend.reg_set(Hive::Hklm, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore", "DisableSR", &RegValue::Dword(flag));
+    Ok(())
+}
+
+fn windows_drive() -> String {
+    let mut buf = [0u16; 260];
+    let n = unsafe { GetWindowsDirectoryW(Some(&mut buf)) };
+    if n == 0 {
+        return r"C:\".into();
+    }
+    let text = String::from_utf16_lossy(&buf[..n as usize]);
+    let letter = text.chars().next().unwrap_or('C');
+    format!(r"{letter}:\")
+}
+
 fn create_restore(description: &str) -> Result<RestorePointInfo, BackendError> {
     let mut info = RESTOREPOINTINFOW::default();
     info.dwEventType = BEGIN_SYSTEM_CHANGE;
@@ -1362,11 +1475,16 @@ fn create_restore(description: &str) -> Result<RestorePointInfo, BackendError> {
     let ok = unsafe { SRSetRestorePointW(&info, &mut status) };
     if !ok.as_bool() {
         let code = unsafe { std::ptr::addr_of!(status.nStatus).read_unaligned().0 };
+        crate::store::trace(&format!("ação criar ponto recusado código={code}"));
         if code == 1058 {
             return Err(BackendError::Failed("PROTECTION_DISABLED".into()));
         }
-        return Err(BackendError::Failed(format!("ponto de restauração recusado (código {code})")));
+        if code == 5 {
+            return Err(BackendError::AccessDenied("criar o ponto de restauração precisa de administrador".into()));
+        }
+        return Err(BackendError::Failed(format!("o Windows recusou o ponto de restauração (código {code})")));
     }
+    crate::store::trace("ação criar ponto aceito pelo Windows");
     let sequence = unsafe { std::ptr::addr_of!(status.llSequenceNumber).read_unaligned() };
     info.dwEventType = END_SYSTEM_CHANGE;
     unsafe { std::ptr::addr_of_mut!(info.llSequenceNumber).write_unaligned(sequence); }

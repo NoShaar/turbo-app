@@ -67,6 +67,33 @@ pub fn read_log(path: &Path) -> Result<Vec<LogEntry>, String> {
     Ok(out)
 }
 
+const TRACE_MAX_BYTES: u64 = 512 * 1024;
+
+/// Log sempre ligado em `%LOCALAPPDATA%\TurboApp\turbo.log`.
+/// Passa de 512 KiB e o arquivo vira `turbo.log.1`.
+pub fn trace(line: &str) {
+    let _ = append_trace(&data_dir().join("turbo.log"), line);
+}
+
+pub fn append_trace(path: &Path, line: &str) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    rotate_trace(path);
+    let mut file = OpenOptions::new().create(true).append(true).open(path).map_err(|e| e.to_string())?;
+    writeln!(file, "{} {line}", now_rfc3339()).map_err(|e| e.to_string())
+}
+
+fn rotate_trace(path: &Path) {
+    let len = fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+    if len < TRACE_MAX_BYTES {
+        return;
+    }
+    let previous = path.with_extension("log.1");
+    let _ = fs::remove_file(&previous);
+    let _ = fs::rename(path, previous);
+}
+
 pub fn log_change(path: &Path, id: &str, action: &str, ok: bool, message: &str, before: &impl Serialize, after: &impl Serialize) -> Result<(), String> {
     let entry = LogEntry {
         ts: now_rfc3339(),
@@ -121,6 +148,28 @@ pub struct AdminCacheFile {
 pub fn load_admin_cache(path: &Path) -> AdminCacheFile {
     let Ok(bytes) = fs::read(path) else { return AdminCacheFile::default(); };
     serde_json::from_slice(&bytes).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trace_writes_and_rotates() {
+        let dir = std::env::temp_dir().join(format!("turbo-trace-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("turbo.log");
+        append_trace(&path, "primeira").unwrap();
+        append_trace(&path, &"x".repeat(600_000)).unwrap();
+        append_trace(&path, "depois da rotação").unwrap();
+        let current = fs::read_to_string(&path).unwrap();
+        assert!(current.contains("depois da rotação"));
+        assert!(!current.contains("primeira"));
+        let previous = fs::read_to_string(path.with_extension("log.1")).unwrap();
+        assert!(previous.contains("primeira"));
+        let _ = fs::remove_dir_all(dir);
+    }
 }
 
 pub fn save_admin_cache(path: &Path, cache: &AdminCacheFile) -> Result<(), String> {

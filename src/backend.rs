@@ -56,7 +56,9 @@ pub trait SystemBackend {
     fn security_status(&self) -> Result<SecurityStatus, BackendError>;
 
     fn protection_enabled(&self) -> Result<bool, BackendError>;
+    fn set_system_protection(&mut self, enabled: bool) -> Result<(), BackendError>;
     fn recent_restore_point(&self) -> Result<Option<RestorePointInfo>, BackendError>;
+    fn restore_point_visible(&self, sequence: i64) -> Result<bool, BackendError>;
     fn create_restore_point(&mut self, description: &str) -> Result<RestorePointInfo, BackendError>;
 
     fn is_elevated(&self) -> bool;

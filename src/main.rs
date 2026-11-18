@@ -36,7 +36,7 @@ struct Session {
 #[derive(Clone)]
 enum Pending {
     None,
-    AckProtection,
+    EnableProtection,
     NeedBackup(FollowUp),
     Confirm(FollowUp),
     Hz { token: u64 },
@@ -53,6 +53,7 @@ enum FollowUp {
 
 fn main() {
     install_panic_hook();
+    store::trace(&format!("processo Turbo {}", turbo::model::APP_VERSION));
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--version") {
         println!("Turbo {APP_VERSION}");
@@ -123,6 +124,16 @@ fn ui_main() {
     // que o loop está no ar, e o COM MTA fica numa thread de trabalho.
     slint::Timer::single_shot(Duration::from_millis(0), move || {
         if let Some(ui) = weak.upgrade() {
+            let mut elevated = true;
+            with_backend(&host_boot, |sys| elevated = sys.is_elevated());
+            // No Linux a demonstração não é um processo elevado, mas os botões
+            // do exemplo precisam continuar usáveis. No Windows o manifesto
+            // pede administrador; se mesmo assim não estiver elevado, a faixa aparece.
+            #[cfg(windows)]
+            ui.set_elevated(elevated);
+            #[cfg(not(windows))]
+            ui.set_elevated(true);
+            store::trace(&format!("janela aberta elevado={elevated}"));
             refresh(&ui, &host_boot, &session_boot, false);
             spawn_disk_sample(ui.as_weak(), host_boot.clone(), session_boot.clone());
             spawn_update_check(ui.as_weak(), false);
@@ -230,6 +241,25 @@ fn wire_actions(ui: &MainWindow, host: &Arc<Host>, session: &Arc<Mutex<Session>>
     let ui_up = ui.as_weak();
     ui.on_check_updates(move || spawn_update_check(ui_up.clone(), true));
 
+    let ui_admin = ui.as_weak();
+    ui.on_relaunch_admin(move || {
+        #[cfg(windows)]
+        {
+            if elevate_command("") {
+                std::process::exit(0);
+            }
+            if let Some(ui) = ui_admin.upgrade() {
+                ui.set_toast("O Windows não abriu a janela de administrador.".into());
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            if let Some(ui) = ui_admin.upgrade() {
+                ui.set_toast("Reabrir como administrador só existe no Windows.".into());
+            }
+        }
+    });
+
     let ui_yes = ui.as_weak();
     let host_yes = host.clone();
     let session_yes = session.clone();
@@ -239,9 +269,9 @@ fn wire_actions(ui: &MainWindow, host: &Arc<Host>, session: &Arc<Mutex<Session>>
             let pending = session_yes.lock().expect("sessão").pending.clone();
             session_yes.lock().expect("sessão").pending = Pending::None;
             match pending {
-                Pending::AckProtection => {
+                Pending::EnableProtection => {
                     let next = session_yes.lock().expect("sessão").resume.take();
-                    if start_backup(&ui, &host_yes, &session_yes, true) {
+                    if enable_protection_and_backup(&ui, &host_yes, &session_yes) {
                         if let Some(next) = next {
                             run_follow(&ui, &host_yes, &session_yes, next);
                         }
@@ -272,9 +302,20 @@ fn wire_actions(ui: &MainWindow, host: &Arc<Host>, session: &Arc<Mutex<Session>>
             ui.set_dialog_open(false);
             let pending = session_no.lock().expect("sessão").pending.clone();
             session_no.lock().expect("sessão").pending = Pending::None;
-            if let Pending::Hz { token } = pending {
-                session_no.lock().expect("sessão").hz_token = token.wrapping_add(1);
-                run_follow(&ui, &host_no, &session_no, FollowUp::RevertOne("g-hz".into()));
+            match pending {
+                Pending::Hz { token } => {
+                    session_no.lock().expect("sessão").hz_token = token.wrapping_add(1);
+                    run_follow(&ui, &host_no, &session_no, FollowUp::RevertOne("g-hz".into()));
+                }
+                Pending::EnableProtection => {
+                    let next = session_no.lock().expect("sessão").resume.take();
+                    if start_backup(&ui, &host_no, &session_no, true) {
+                        if let Some(next) = next {
+                            run_follow(&ui, &host_no, &session_no, next);
+                        }
+                    }
+                }
+                _ => {}
             }
         }
     });
@@ -342,7 +383,8 @@ fn show_page(ui: &MainWindow, session: &Mutex<Session>, host: &Host, id: &str) {
             let title = Section::all().iter().find(|s| s.id() == other).map(|s| s.label()).unwrap_or(other);
             ui.set_section_title(title.into());
             let views = session.lock().expect("sessão").views.clone();
-            let cards: Vec<Card> = views.into_iter().filter(|v| v.section.id() == other).map(card_from).collect();
+            let elevated = ui.get_elevated();
+            let cards: Vec<Card> = views.into_iter().filter(|v| v.section.id() == other).map(|view| card_from(view, elevated)).collect();
             ui.set_cards(model(cards));
             let _ = host;
         }
@@ -365,8 +407,19 @@ fn refresh(ui: &MainWindow, host: &Host, session: &Mutex<Session>, keep_page: bo
         }
     });
     if let Some(err) = error {
-        ui.set_toast(err.into());
+        let message = format!("O diagnóstico inteiro falhou: {err}");
+        store::trace(&message);
+        ui.set_toast(message.into());
         return;
+    }
+    let failed: Vec<String> = views.iter().filter(|v| v.detail.starts_with("Falha ao ler")).map(|v| v.detail.clone()).collect();
+    if failed.is_empty() {
+        let previous = ui.get_toast().to_string();
+        if previous.contains("0x") || previous.contains("HRESULT") || previous.starts_with("Falha ao ler") || previous.starts_with("O diagnóstico") {
+            ui.set_toast("".into());
+        }
+    } else {
+        ui.set_toast(failed.join(" · ").into());
     }
     let ok = views.iter().filter(|v| v.state == ItemState::Ok).count();
     let improve = views.iter().filter(|v| v.state == ItemState::CanImprove).count();
@@ -394,23 +447,78 @@ fn start_backup(ui: &MainWindow, host: &Host, session: &Mutex<Session>, ack: boo
         Err(err) => failed = Some(err.to_string()),
     });
     if let Some(message) = denied {
-        open_dialog(ui, "Proteção do Sistema desligada", &message, "Continuar só com o JSON", "Agora não", true);
-        session.lock().expect("sessão").pending = Pending::AckProtection;
+        store::trace("ação backup proteção desligada, pedindo confirmação");
+        open_dialog(
+            ui,
+            "Proteção do Sistema desligada",
+            &format!("{message}\n\nPosso ligar a proteção no disco do Windows para criar o ponto. Reverter tudo desliga de novo, se o Turbo tiver ligado."),
+            "Ativar proteção e criar o ponto",
+            "Continuar só com o JSON",
+            true,
+        );
+        session.lock().expect("sessão").pending = Pending::EnableProtection;
         return false;
     }
     if let Some(err) = failed {
-        ui.set_toast(err.into());
+        store::trace(&format!("ação backup falhou: {err}"));
+        ui.set_toast(err.clone().into());
+        open_dialog(ui, "Não criei o backup", &err, "Ok", "", false);
         return false;
     }
-    let backup = created.expect("backup");
+    let Some(backup) = created else {
+        let message = "O backup não devolveu resultado. Veja %LOCALAPPDATA%\\TurboApp\\turbo.log.".to_string();
+        store::trace(&format!("ação backup sem resultado"));
+        ui.set_toast(message.clone().into());
+        open_dialog(ui, "Não criei o backup", &message, "Ok", "", false);
+        return false;
+    };
     if store::save_backup(&store::backup_path(), &backup).is_err() {
-        ui.set_toast("Não consegui gravar o backup JSON.".into());
+        let message = "Não consegui gravar o backup JSON em %LOCALAPPDATA%\\TurboApp\\backup.json.".to_string();
+        store::trace(&format!("ação backup {message}"));
+        ui.set_toast(message.clone().into());
+        open_dialog(ui, "Não gravei o backup", &message, "Ok", "", false);
         return false;
     }
     let _ = store::append_log(&store::log_path(), &engine::backup_log_entry(&backup));
-    ui.set_toast(backup.restore_point.message.clone().into());
+    let title = match backup.restore_point.status {
+        turbo::model::RestorePointStatus::Created => "Backup criado",
+        turbo::model::RestorePointStatus::UsedExisting => "Backup criado com o ponto que já existia",
+        turbo::model::RestorePointStatus::ProtectionDisabled => "Backup só com o JSON",
+        turbo::model::RestorePointStatus::Failed => "Backup incompleto",
+    };
+    let message = backup.restore_point.message.clone();
+    store::trace(&format!("ação backup gravado: {message}"));
+    ui.set_toast(message.clone().into());
+    open_dialog(ui, title, &message, "Ok", "", false);
+    session.lock().expect("sessão").pending = Pending::None;
     session.lock().expect("sessão").backup = Some(backup);
     refresh(ui, host, session, true);
+    true
+}
+
+fn enable_protection_and_backup(ui: &MainWindow, host: &Host, session: &Mutex<Session>) -> bool {
+    let mut error = None;
+    with_backend(host, |sys| {
+        if let Err(err) = sys.set_system_protection(true) {
+            error = Some(err.to_string());
+        }
+    });
+    if let Some(err) = error {
+        let message = format!("Não liguei a Proteção do Sistema: {err}");
+        store::trace(&format!("ação {message}"));
+        ui.set_toast(message.clone().into());
+        open_dialog(ui, "Proteção do Sistema", &message, "Ok", "", false);
+        return false;
+    }
+    if !start_backup(ui, host, session, false) {
+        return false;
+    }
+    let mut guard = session.lock().expect("sessão");
+    if let Some(backup) = guard.backup.as_mut() {
+        backup.restore_point.protection_enabled_by_app = true;
+        let _ = store::save_backup(&store::backup_path(), backup);
+        store::trace("ação proteção do sistema ligada pelo Turbo e marcada para reversão");
+    }
     true
 }
 
@@ -482,11 +590,12 @@ fn run_follow(ui: &MainWindow, host: &Arc<Host>, session: &Arc<Mutex<Session>>, 
         ui.set_toast(err.into());
         return;
     }
-    if local.is_empty() && admin_ids.is_empty() {
+    let reverting = matches!(follow, FollowUp::RevertOne(_) | FollowUp::RevertSection | FollowUp::RevertAll);
+    let turn_protection_off = matches!(follow, FollowUp::RevertAll) && backup.restore_point.protection_enabled_by_app;
+    if local.is_empty() && admin_ids.is_empty() && !turn_protection_off {
         ui.set_toast("Nada para fazer aqui.".into());
         return;
     }
-    let reverting = matches!(follow, FollowUp::RevertOne(_) | FollowUp::RevertSection | FollowUp::RevertAll);
     let log = store::log_path();
     let mut lines = Vec::new();
     with_backend(host, |sys| {
@@ -501,6 +610,12 @@ fn run_follow(ui: &MainWindow, host: &Arc<Host>, session: &Arc<Mutex<Session>>, 
                 Ok(ok) => ok.message,
                 Err(err) => err,
             });
+        }
+        if turn_protection_off {
+            match sys.set_system_protection(false) {
+                Ok(()) => lines.push("Proteção do Sistema desligada de novo, como estava antes do Turbo.".into()),
+                Err(err) => lines.push(format!("Não consegui desligar a Proteção do Sistema que o Turbo tinha ligado: {err}")),
+            }
         }
     });
     if local.iter().any(|id| id == "g-hz") && !reverting && lines.iter().any(|l| !l.contains("não confirmou") && !l.contains("restaurou")) {
@@ -893,7 +1008,8 @@ fn wait_file(path: &Path, timeout: Duration) -> bool {
     false
 }
 
-fn card_from(view: ItemView) -> Card {
+fn card_from(view: ItemView, elevated: bool) -> Card {
+    let admin_locked = !elevated && meta(&view.id).map(|item| item.needs_admin_apply).unwrap_or(false);
     let kind = match view.state {
         ItemState::Ok => "ok",
         ItemState::CanImprove => "improve",
@@ -916,6 +1032,7 @@ fn card_from(view: ItemView) -> Card {
         readonly: view.readonly,
         needs_admin_read: view.needs_admin_read,
         show_resmon: view.id == "d-uso",
+        admin_locked,
     }
 }
 

@@ -1,10 +1,10 @@
 {
-  "version": "1.0.1",
-  "notes": "Corrige o fechamento imediato ao abrir no Windows 11 (OleInitialize / RPC_E_CHANGED_MODE, exceção 0xc0000409). O diagnóstico COM e WMI passa a rodar numa thread de trabalho, fora da thread da janela. Se o app falhar, a mensagem e o backtrace vão para %LOCALAPPDATA%\\TurboApp\\crash.log e uma caixa de diálogo aparece. O executável e o instalador agora identificam o produto Turbo App, a empresa NoShaar e a versão 1.0.1.",
+  "version": "1.0.2",
+  "notes": "Corrige o diagnóstico que ficava zerado. A consulta da placa de rede usava LinkSpeed, propriedade que não existe em MSFT_NetAdapter, e esse erro derrubava todas as leituras. Cada item que falha fica só como não lido, com o motivo em português. O app pede administrador ao abrir. O backup mostra o erro, respeita o limite de 24 h e oferece ligar a Proteção do Sistema, de forma reversível. O registro fica em %LOCALAPPDATA%\\TurboApp\\turbo.log.",
   "setup": {
     "name": "TurboApp-Setup.exe",
-    "url": "https://github.com/NoShaar/turbo-app/releases/download/v1.0.1/TurboApp-Setup.exe",
-    "sha256": "0c941fdc004ecb604a7ddec94658a85335bf3d39522eb59c894b5c9cbdd4b6a3",
-    "signature": "aaf02a1056010218b86395ef1fa7f062781a2b430cd675566c2a9f7a5ba1a382b1aba85357b303bc237d76bec1f8417906c684317d3a882efe6a8e1e2f0e8c0c"
+    "url": "https://github.com/NoShaar/turbo-app/releases/download/v1.0.2/TurboApp-Setup.exe",
+    "sha256": "78e971911debec4ab6c759472bc38e172fc1172942dcce4addcffda7142a61c2",
+    "signature": "ee41f6809e2a006b8548be683f00ec4f0609f58051723cdc5a3bb82e0de67f3c098c4b9eeae0b2184174cafdf8a96b4da71b10b32e24fddacbeb77bf9fa99f0c"
   }
 }

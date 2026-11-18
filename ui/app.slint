@@ -23,6 +23,7 @@ export struct Card {
     readonly: bool,
     needs-admin-read: bool,
     show-resmon: bool,
+    admin-locked: bool,
 }
 
 export struct Row3 {
@@ -133,7 +134,8 @@ export component MainWindow inherits Window {
     in-out property <string> update-body: "";
     in-out property <string> toast: "";
     in-out property <string> log-text: "";
-    in-out property <string> version-label: "1.0.1";
+    in-out property <bool> elevated: true;
+    in-out property <string> version-label: "1.0.2";
 
     callback nav-clicked(string);
     callback optimize(string);
@@ -151,6 +153,7 @@ export component MainWindow inherits Window {
     callback cancel-dialog();
     callback update-accept();
     callback update-later();
+    callback relaunch-admin();
 
     HorizontalLayout {
         Rectangle {
@@ -252,43 +255,74 @@ export component MainWindow inherits Window {
                     horizontal-alignment: center;
                 }
             }
+            if !root.elevated: Rectangle {
+                min-height: 48px;
+                background: #3a2a14;
+                HorizontalLayout {
+                    padding-left: 16px;
+                    padding-right: 16px;
+                    spacing: 12px;
+                    alignment: center;
+                    Text {
+                        text: "Rodando sem administrador. Backup, HKLM, serviços, rede e SMART ficam bloqueados.";
+                        color: #f5c16c;
+                        font-size: 12px;
+                        wrap: word-wrap;
+                        vertical-alignment: center;
+                        vertical-stretch: 0;
+                    }
+                    Btn { label: "Reabrir como administrador"; primary: true; clicked => { root.relaunch-admin(); } }
+                }
+            }
             Rectangle {
                 background: #101114;
                 if root.page == "home": ScrollView {
                     VerticalLayout {
+                        alignment: start;
                         padding: 22px;
-                        spacing: 14px;
+                        spacing: 12px;
                         Text {
                             text: "Otimização segura, reversível e sem placebo.";
                             color: #f4f7fb;
                             font-size: 22px;
                             font-weight: 700;
                             wrap: word-wrap;
+                            vertical-stretch: 0;
                         }
                         Text {
                             text: "O Turbo lê o PC primeiro. Só muda o que está na especificação, guarda o valor original e confirma a leitura depois. Fechou a janela, não sobra processo.";
                             color: #9aa3af;
                             wrap: word-wrap;
+                            vertical-stretch: 0;
                         }
                         HorizontalLayout {
                             spacing: 12px;
+                            vertical-stretch: 0;
                             Stat { value: root.ok-count; label: "OK"; tone: #3ddc97; }
                             Stat { value: root.improve-count; label: "Pode melhorar"; tone: #f5c16c; }
                             Stat { value: root.unread-count; label: "Não lido / admin"; tone: #8eb6ff; }
                         }
                         Rectangle {
+                            vertical-stretch: 0;
                             background: #1c2027;
                             border-radius: 14px;
                             border-width: 1px;
                             border-color: #ff5a36;
                             VerticalLayout {
+                                alignment: start;
                                 padding: 16px;
-                                spacing: 10px;
-                                Text { text: "Backup antes da primeira alteração"; color: #f4f7fb; font-weight: 700; font-size: 16px; }
-                                Text { text: root.backup-text; color: #c5ccd6; wrap: word-wrap; }
+                                spacing: 8px;
+                                Text { text: "Backup antes da primeira alteração"; color: #f4f7fb; font-weight: 700; font-size: 16px; vertical-stretch: 0; }
+                                Text { text: root.backup-text; color: #c5ccd6; wrap: word-wrap; vertical-stretch: 0; }
                                 HorizontalLayout {
                                     spacing: 8px;
-                                    Btn { label: "Criar backup agora"; primary: true; clicked => { root.create-backup(); } }
+                                    vertical-stretch: 0;
+                                    Btn {
+                                        label: root.elevated ? "Criar backup agora" : "Precisa de admin";
+                                        primary: root.elevated;
+                                        enabled: root.elevated;
+                                        clicked => { root.create-backup(); }
+                                    }
                                     Btn { label: "Ler de novo"; clicked => { root.diagnose(); } }
                                     Btn { label: "Medir disco (10 s)"; clicked => { root.measure-disk(); } }
                                     Btn { label: "Verificar atualizações"; clicked => { root.check-updates(); } }
@@ -296,6 +330,7 @@ export component MainWindow inherits Window {
                             }
                         }
                         if root.critical != "": Rectangle {
+                            vertical-stretch: 0;
                             background: #1c2027;
                             border-radius: 14px;
                             border-width: 1px;
@@ -339,7 +374,12 @@ export component MainWindow inherits Window {
                                 Text { text: "Admin: " + card.admin + "   ·   Reinício: " + card.reboot; color: #6d7580; font-size: 11px; wrap: word-wrap; }
                                 HorizontalLayout {
                                     spacing: 8px;
-                                    if card.can-optimize: Btn { label: "Otimizar"; primary: true; clicked => { root.optimize(card.id); } }
+                                    if card.can-optimize: Btn {
+                                        label: card.admin-locked ? "Precisa de admin" : "Otimizar";
+                                        primary: !card.admin-locked;
+                                        enabled: !card.admin-locked;
+                                        clicked => { root.optimize(card.id); }
+                                    }
                                     if card.can-revert: Btn { label: "Reverter"; clicked => { root.revert(card.id); } }
                                     if card.needs-admin-read: Btn { label: "Ler como admin"; clicked => { root.read-admin(card.id); } }
                                     if card.show-resmon: Btn { label: "Abrir Monitor de Recursos"; clicked => { root.open-resmon(); } }
@@ -392,7 +432,7 @@ export component MainWindow inherits Window {
                             wrap: word-wrap;
                         }
                         Text {
-                            text: "O backup fica em %LOCALAPPDATA%\\TurboApp\\backup.json e o log em log.jsonl. Atualizar ou desinstalar o programa não apaga esses arquivos.";
+                            text: "O backup fica em %LOCALAPPDATA%\\TurboApp\\backup.json, o histórico em log.jsonl e o registro de cada leitura em turbo.log. Atualizar ou desinstalar o programa não apaga esses arquivos.";
                             color: #c5ccd6;
                             wrap: word-wrap;
                         }
@@ -405,9 +445,20 @@ export component MainWindow inherits Window {
                 }
             }
             if root.toast != "": Rectangle {
-                height: 32px;
+                min-height: 36px;
                 background: #1c2027;
-                Text { text: root.toast; color: #9aa3af; font-size: 12px; vertical-alignment: center; x: 16px; }
+                VerticalLayout {
+                    padding: 8px;
+                    padding-left: 16px;
+                    padding-right: 16px;
+                    Text {
+                        text: root.toast;
+                        color: #f0d7a0;
+                        font-size: 12px;
+                        wrap: word-wrap;
+                        vertical-stretch: 0;
+                    }
+                }
             }
         }
     }

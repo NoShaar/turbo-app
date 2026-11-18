@@ -363,6 +363,9 @@ pub struct RestorePointRecord {
     pub message: String,
     pub sequence: Option<i64>,
     pub acknowledged_no_protection: bool,
+    /// O Turbo ligou a Proteção do Sistema para criar o ponto. Reverter tudo desliga de novo.
+    #[serde(default)]
+    pub protection_enabled_by_app: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
